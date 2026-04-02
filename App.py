@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import calendar
 import io
 from dataclasses import dataclass
 from functools import lru_cache
@@ -106,6 +107,7 @@ RULE_SORT_ORDER = {
     "Rule 7": 7,
     "Rule 8": 8,
     "Secondary chart: point beyond control limit": 9,
+    "Multiple rules": 10,
 }
 
 SUPPORTED_UPLOAD_TYPES = ["csv", "xlsx", "xls"]
@@ -116,6 +118,11 @@ PLOT_HEIGHT_DEFAULT = 780
 NULL_TREATMENT_OPTIONS = {
     "Discard null/empty measurement observations": "discard",
     "Make null/empty measurement observations zero": "zero",
+}
+
+BACKTRACK_OPTIONS = {
+    "Backtrack over all periods": "all_periods",
+    "Backtrack for the same period": "same_period",
 }
 
 # ============================================================
@@ -211,6 +218,17 @@ def format_period_label(period: pd.Period, granularity: str) -> str:
     return str(period)
 
 
+def format_focus_label(granularity: str, focus_value: int | None) -> str | None:
+    """Format a selected focus value (month/quarter) for display."""
+    if focus_value is None:
+        return None
+    if granularity == "quarterly":
+        return f"Quarter {int(focus_value)}"
+    if granularity == "monthly":
+        return calendar.month_name[int(focus_value)]
+    return None
+
+
 def _get_uploaded_file_bytes(uploaded_file) -> bytes:
     """Read uploaded file into raw bytes."""
     uploaded_file.seek(0)
@@ -264,6 +282,79 @@ def filter_df_by_date_range(
     working_dates = pd.to_datetime(df_work[date_col], errors="coerce")
     mask = working_dates.between(start_ts, end_ts, inclusive="both")
     return df_work.loc[mask].copy()
+
+
+def concat_violations(
+    primary_violations: pd.DataFrame,
+    secondary_violations: pd.DataFrame,
+) -> pd.DataFrame:
+    """Combine primary and secondary violations into a single DataFrame."""
+    frames = []
+    if primary_violations is not None and not primary_violations.empty:
+        frames.append(primary_violations[["date", "rule"]].copy())
+    if secondary_violations is not None and not secondary_violations.empty:
+        frames.append(secondary_violations[["date", "rule"]].copy())
+    if not frames:
+        return pd.DataFrame(columns=["date", "rule"])
+    return pd.concat(frames, ignore_index=True)
+
+
+def get_most_common_rule(
+    primary_violations: pd.DataFrame,
+    secondary_violations: pd.DataFrame,
+) -> str | None:
+    """
+    Determine the single most common rule across the figure.
+    Ties are broken by RULE_SORT_ORDER.
+    """
+    all_violations = concat_violations(primary_violations, secondary_violations)
+    if all_violations.empty:
+        return None
+
+    counts = (
+        all_violations
+        .groupby("rule", as_index=False)
+        .size()
+        .rename(columns={"size": "count"})
+    )
+    counts["sort_order"] = counts["rule"].map(lambda x: RULE_SORT_ORDER.get(x, 999))
+    counts = counts.sort_values(["count", "sort_order"], ascending=[False, True]).reset_index(drop=True)
+
+    return str(counts.loc[0, "rule"])
+
+
+@st.cache_data(show_spinner=False)
+def get_available_focus_values(df_work: pd.DataFrame, date_col: str, granularity: str) -> list[int]:
+    """Return the available month or quarter values present in the dataset."""
+    valid_dates = pd.to_datetime(df_work[date_col], errors="coerce").dropna()
+    if valid_dates.empty:
+        return []
+
+    if granularity == "quarterly":
+        return sorted(valid_dates.dt.quarter.dropna().astype(int).unique().tolist())
+    if granularity == "monthly":
+        return sorted(valid_dates.dt.month.dropna().astype(int).unique().tolist())
+    return []
+
+
+@st.cache_data(show_spinner=False)
+def count_available_period_occurrences(
+    df_work: pd.DataFrame,
+    date_col: str,
+    granularity: str,
+    backtrack_mode: str = "all_periods",
+    focus_value: int | None = None,
+) -> int:
+    """Count the number of available periods for the requested mode."""
+    periods = get_selected_periods(
+        df_work=df_work,
+        date_col=date_col,
+        granularity=granularity,
+        requested_count=10_000_000,  # effectively all
+        backtrack_mode=backtrack_mode,
+        focus_value=focus_value,
+    )
+    return len(periods)
 
 
 # ============================================================
@@ -969,8 +1060,15 @@ def add_rule_markers(
     legend_shown_rules: set[str],
     x_col: str,
     x_axis_mode: str,
+    default_visible_rule: str | None,
 ) -> set[str]:
-    """Add rule markers and multi-rule segmented overlays to a subplot."""
+    """
+    Add rule markers and multi-rule segmented overlays to a subplot.
+
+    Updated behavior:
+    - only the single most common rule for the whole figure is visible by default
+    - all other rule traces (including "Multiple rules") start as legend-only
+    """
     if violations_df.empty:
         return legend_shown_rules
 
@@ -1007,6 +1105,7 @@ def add_rule_markers(
         rule_points = merged[merged["rule"] == rule_name].copy()
         style = RULE_STYLE_MAP.get(rule_name, DEFAULT_RULE_STYLE)
         show_legend = rule_name not in legend_shown_rules
+        visible_state = True if rule_name == default_visible_rule else "legendonly"
 
         if x_axis_mode == "Time":
             x_vals = rule_points["date"]
@@ -1044,6 +1143,7 @@ def add_rule_markers(
                 name=style["label"],
                 legendgroup=rule_name,
                 showlegend=show_legend,
+                visible=visible_state,
                 marker=dict(
                     color=style["color"],
                     size=10,
@@ -1063,6 +1163,7 @@ def add_rule_markers(
 
         style = RULE_STYLE_MAP["Multiple rules"]
         show_legend = "Multiple rules" not in legend_shown_rules
+        multiple_visible_state = True if default_visible_rule == "Multiple rules" else "legendonly"
 
         hover_text = []
         for _, record in multi_rule_df.iterrows():
@@ -1099,6 +1200,7 @@ def add_rule_markers(
                 name=style["label"],
                 legendgroup="Multiple rules",
                 showlegend=show_legend,
+                visible=multiple_visible_state,
                 marker=dict(
                     size=12,
                     color="rgba(0,0,0,0)",
@@ -1121,6 +1223,7 @@ def add_rule_markers(
                 name=None,
                 legendgroup="Multiple rules",
                 showlegend=False,
+                visible=multiple_visible_state,
                 marker=dict(
                     symbol="x",
                     size=10,
@@ -1192,6 +1295,7 @@ def add_rule_markers(
                         name=None,
                         legendgroup="Multiple rules",
                         showlegend=False,
+                        visible=multiple_visible_state,
                         line=dict(color=color, width=1),
                         hoverinfo="skip",
                     ),
@@ -1223,6 +1327,8 @@ def plot_spc_chart(
     else:
         x_col = "subgroup_number"
         x_axis_title = "Subgroup Number"
+
+    default_visible_rule = get_most_common_rule(primary_violations, secondary_violations)
 
     fig = make_subplots(
         rows=2,
@@ -1274,6 +1380,7 @@ def plot_spc_chart(
         legend_shown_rules=legend_shown_rules,
         x_col=x_col,
         x_axis_mode=x_axis_mode,
+        default_visible_rule=default_visible_rule,
     )
 
     # Secondary series
@@ -1317,6 +1424,7 @@ def plot_spc_chart(
             legend_shown_rules=legend_shown_rules,
             x_col=x_col,
             x_axis_mode=x_axis_mode,
+            default_visible_rule=default_visible_rule,
         )
 
     fig.update_layout(
@@ -1453,13 +1561,24 @@ def check_unsupported_group_sizes(df_work: pd.DataFrame, measurement_col: str, s
 
 
 @st.cache_data(show_spinner=False)
-def get_recent_periods(
+def get_selected_periods(
     df_work: pd.DataFrame,
     date_col: str,
     granularity: str,
-    n_periods: int,
+    requested_count: int,
+    backtrack_mode: str = "all_periods",
+    focus_value: int | None = None,
 ) -> list[pd.Period]:
-    """Return the most recent N periods available in the data."""
+    """
+    Return the selected periods for additional I-MR chart creation.
+
+    Modes:
+    - all_periods: current behavior, take the most recent N distinct periods
+    - same_period:
+        * quarterly -> same quarter across years
+        * monthly -> same month across years
+        * yearly -> behaves the same as all_periods
+    """
     freq_map = {"yearly": "Y", "quarterly": "Q", "monthly": "M"}
     freq = freq_map[granularity]
 
@@ -1467,33 +1586,53 @@ def get_recent_periods(
     if valid_dates.empty:
         return []
 
-    periods = pd.Series(valid_dates.dt.to_period(freq).unique())
-    periods = periods.sort_values()
-    periods_list = periods.tolist()
+    periods = pd.Series(valid_dates.dt.to_period(freq).unique()).sort_values().tolist()
 
-    return periods_list[-n_periods:] if n_periods > 0 else []
+    if backtrack_mode == "same_period":
+        if granularity == "quarterly" and focus_value is not None:
+            periods = [p for p in periods if int(p.quarter) == int(focus_value)]
+        elif granularity == "monthly" and focus_value is not None:
+            periods = [p for p in periods if int(p.month) == int(focus_value)]
+        # yearly intentionally falls back to normal behavior
+
+    return periods[-requested_count:] if requested_count > 0 else []
 
 
 @st.cache_data(show_spinner=False)
-def get_recent_period_chart_payloads(
+def get_imr_period_chart_payloads(
     df_work: pd.DataFrame,
     measurement_col: str,
     date_col: str,
     granularity: str,
     requested_count: int,
+    backtrack_mode: str = "all_periods",
+    focus_value: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Build chart payloads for the requested recent periods, preserving existing period logic."""
+    """
+    Build chart payloads for requested additional periods.
+
+    Supports:
+    - backtrack over all periods
+    - backtrack for the same period (same quarter or same month across years)
+    """
     freq_map = {"yearly": "Y", "quarterly": "Q", "monthly": "M"}
     working_dates = pd.to_datetime(df_work[date_col], errors="coerce")
-    recent_periods = get_recent_periods(df_work, date_col, granularity, requested_count)
+    selected_periods = get_selected_periods(
+        df_work=df_work,
+        date_col=date_col,
+        granularity=granularity,
+        requested_count=requested_count,
+        backtrack_mode=backtrack_mode,
+        focus_value=focus_value,
+    )
 
-    if not recent_periods:
+    if not selected_periods:
         return []
 
     freq = freq_map[granularity]
     payloads: list[dict[str, Any]] = []
 
-    for period in recent_periods:
+    for period in selected_periods:
         period_mask = working_dates.dt.to_period(freq) == period
         period_df = df_work.loc[period_mask].copy()
 
@@ -1545,7 +1684,7 @@ def get_recent_period_chart_payloads(
     return payloads
 
 
-def render_imr_periodic_options(df_work: pd.DataFrame, date_col: str) -> dict[str, int]:
+def render_imr_periodic_options(df_work: pd.DataFrame, date_col: str) -> dict[str, dict[str, Any]]:
     """Render post-violation controls for additional yearly/quarterly/monthly I-MR charts."""
     st.markdown("### Additional time-based I‑MR charts")
 
@@ -1557,43 +1696,106 @@ def render_imr_periodic_options(df_work: pd.DataFrame, date_col: str) -> dict[st
     if not create_periodic:
         return {}
 
+    backtrack_mode_label = st.radio(
+        "How should the additional charts backtrack?",
+        options=list(BACKTRACK_OPTIONS.keys()),
+        index=0,
+        horizontal=True,
+        key="imr_backtrack_mode",
+    )
+    backtrack_mode = BACKTRACK_OPTIONS[backtrack_mode_label]
+
     selections = st.multiselect(
         "Select period types",
         options=["yearly", "quarterly", "monthly"],
         default=[],
     )
 
-    period_requests: dict[str, int] = {}
+    period_requests: dict[str, dict[str, Any]] = {}
     freq_map = {"yearly": "Y", "quarterly": "Q", "monthly": "M"}
 
     for granularity in selections:
-        available_periods = (
+        available_periods_total = (
             pd.to_datetime(df_work[date_col], errors="coerce")
             .dropna()
             .dt.to_period(freq_map[granularity])
             .nunique()
         )
 
-        if available_periods == 0:
+        if available_periods_total == 0:
             st.info(f"No valid dates are available for {granularity} chart creation.")
             continue
 
+        focus_value: int | None = None
+        focus_label: str | None = None
+        available_periods = int(available_periods_total)
+
+        if backtrack_mode == "same_period" and granularity in ["quarterly", "monthly"]:
+            focus_options = get_available_focus_values(df_work, date_col, granularity)
+
+            if not focus_options:
+                st.info(f"No valid {granularity[:-2]} values are available for {granularity} chart creation.")
+                continue
+
+            if granularity == "quarterly":
+                option_labels = {f"Quarter {q}": q for q in focus_options}
+                selected_focus_label = st.selectbox(
+                    "Which quarter should be tracked across years?",
+                    options=list(option_labels.keys()),
+                    key=f"focus_value_{granularity}",
+                )
+                focus_value = int(option_labels[selected_focus_label])
+            else:
+                option_labels = {calendar.month_name[m]: m for m in focus_options}
+                selected_focus_label = st.selectbox(
+                    "Which month should be tracked across years?",
+                    options=list(option_labels.keys()),
+                    key=f"focus_value_{granularity}",
+                )
+                focus_value = int(option_labels[selected_focus_label])
+
+            focus_label = format_focus_label(granularity, focus_value)
+            available_periods = count_available_period_occurrences(
+                df_work=df_work,
+                date_col=date_col,
+                granularity=granularity,
+                backtrack_mode=backtrack_mode,
+                focus_value=focus_value,
+            )
+
+            if available_periods == 0:
+                st.info(f"No historical {focus_label} periods are available in the data.")
+                continue
+
         label_map = {
             "yearly": "How many recent years should have separate SPC charts created?",
-            "quarterly": "How many recent quarters should have separate SPC charts created?",
-            "monthly": "How many recent months should have separate SPC charts created?",
+            "quarterly": (
+                f"How many periods should be created for {focus_label} across years?"
+                if backtrack_mode == "same_period" and focus_label
+                else "How many recent quarters should have separate SPC charts created?"
+            ),
+            "monthly": (
+                f"How many periods should be created for {focus_label} across years?"
+                if backtrack_mode == "same_period" and focus_label
+                else "How many recent months should have separate SPC charts created?"
+            ),
         }
 
-        period_requests[granularity] = int(
-            st.number_input(
-                label_map[granularity],
-                min_value=1,
-                max_value=int(available_periods),
-                value=min(1, int(available_periods)),
-                step=1,
-                key=f"period_count_{granularity}",
-            )
-        )
+        period_requests[granularity] = {
+            "count": int(
+                st.number_input(
+                    label_map[granularity],
+                    min_value=1,
+                    max_value=int(available_periods),
+                    value=min(1, int(available_periods)),
+                    step=1,
+                    key=f"period_count_{granularity}_{backtrack_mode}_{focus_value}",
+                )
+            ),
+            "backtrack_mode": backtrack_mode,
+            "focus_value": focus_value,
+            "focus_label": focus_label,
+        }
 
     return period_requests
 
@@ -1602,13 +1804,15 @@ def render_imr_periodic_charts(
     df_work: pd.DataFrame,
     measurement_col: str,
     date_col: str,
-    period_requests: dict[str, int],
+    period_requests: dict[str, dict[str, Any]],
 ) -> None:
     """
-    Create additional I-MR charts for selected recent years/quarters/months.
+    Create additional I-MR charts for selected yearly / quarterly / monthly periods.
 
-    Updated per request:
-    - each additional chart is rendered inside its own Streamlit tab
+    Updated behavior:
+    - supports backtracking over all periods
+    - supports backtracking for the same quarter or month across years
+    - each chart is rendered inside its own Streamlit tab
     - the chart, limit summary, and violation dataframes stay together in the same tab
     """
     if not period_requests:
@@ -1616,13 +1820,15 @@ def render_imr_periodic_charts(
 
     tab_payloads: list[dict[str, Any]] = []
 
-    for granularity, requested_count in period_requests.items():
-        payloads = get_recent_period_chart_payloads(
+    for granularity, config in period_requests.items():
+        payloads = get_imr_period_chart_payloads(
             df_work=df_work,
             measurement_col=measurement_col,
             date_col=date_col,
             granularity=granularity,
-            requested_count=requested_count,
+            requested_count=int(config["count"]),
+            backtrack_mode=str(config["backtrack_mode"]),
+            focus_value=config.get("focus_value"),
         )
         tab_payloads.extend(payloads)
 
