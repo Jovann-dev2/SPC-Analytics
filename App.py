@@ -1463,7 +1463,24 @@ def clean_working_data(
         df_work = df_work.dropna(subset=[measurement_col])
 
     if date_col:
-        df_work[date_col] = parse_date(df_work[date_col])
+    df_work[date_col] = parse_date(df_work[date_col])
+
+    # aggregate duplicate dates
+    duplicate_counts = df_work[date_col].value_counts()
+    has_duplicates = (duplicate_counts > 1).any()
+
+    if has_duplicates:
+        df_work = (
+            df_work
+            .groupby(date_col, as_index=False, sort=True)
+            .agg({measurement_col: "sum"})
+        )
+
+        # annotate aggregation for UI
+        df_work.attrs["dates_aggregated"] = True
+        df_work.attrs["aggregated_date_count"] = int((duplicate_counts > 1).sum())
+    else:
+        df_work.attrs["dates_aggregated"] = False
 
     if subgroup_col:
         df_work[subgroup_col] = df_work[subgroup_col].astype(str)
@@ -2012,6 +2029,15 @@ def render_imr_main_date_selector(df_work: pd.DataFrame, date_col: str) -> tuple
     if start_ts > end_ts:
         st.warning("The selected start date must be earlier than or equal to the end date.")
         return None
+
+    # Notify user if date aggregation occurred
+    if df_work.attrs.get("dates_aggregated", False):
+        agg_count = df_work.attrs.get("aggregated_date_count", 0)
+        st.sidebar.info(
+            f"ℹ️ Duplicate dates were detected in the selected range.\n\n"
+            f"Measurements for the same date were automatically **aggregated (summed)**.\n\n"
+            f"Affected dates: {agg_count}"
+        )
 
     return start_ts, end_ts
 
