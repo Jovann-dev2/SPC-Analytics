@@ -1463,24 +1463,24 @@ def clean_working_data(
         df_work = df_work.dropna(subset=[measurement_col])
 
     if date_col:
-    df_work[date_col] = parse_date(df_work[date_col])
+        df_work[date_col] = parse_date(df_work[date_col])
 
-    # aggregate duplicate dates
-    duplicate_counts = df_work[date_col].value_counts()
-    has_duplicates = (duplicate_counts > 1).any()
+        # aggregate duplicate dates
+        duplicate_counts = df_work[date_col].value_counts()
+        has_duplicates = (duplicate_counts > 1).any()
 
-    if has_duplicates:
-        df_work = (
-            df_work
-            .groupby(date_col, as_index=False, sort=True)
-            .agg({measurement_col: "sum"})
-        )
+        if has_duplicates:
+            df_work = (
+                df_work
+                .groupby(date_col, as_index=False, sort=True)
+                .agg({measurement_col: "sum"})
+            )
 
-        # annotate aggregation for UI
-        df_work.attrs["dates_aggregated"] = True
-        df_work.attrs["aggregated_date_count"] = int((duplicate_counts > 1).sum())
-    else:
-        df_work.attrs["dates_aggregated"] = False
+            # annotate aggregation for UI
+            df_work.attrs["dates_aggregated"] = True
+            df_work.attrs["aggregated_date_count"] = int((duplicate_counts > 1).sum())
+        else:
+            df_work.attrs["dates_aggregated"] = False
 
     if subgroup_col:
         df_work[subgroup_col] = df_work[subgroup_col].astype(str)
