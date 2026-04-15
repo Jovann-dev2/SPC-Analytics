@@ -15,7 +15,7 @@ from plotly.subplots import make_subplots
 # ============================================================
 # Streamlit App Configuration
 # ============================================================
-APP_TITLE = "📈 SPC App: I‑MR, Xbar‑R, Xbar‑S"
+APP_TITLE = "SPC App: I‑MR, Xbar‑R, Xbar‑S"
 APP_SUBTITLE = (
     "Use this app to upload your data, choose the relevant columns, and create SPC charts "
     "to monitor process behaviour over time. The app highlights possible special-cause "
@@ -2309,7 +2309,13 @@ def render_imr_periodic_charts(
                 scale_segmented_histograms=scale_segmented_histograms,
             )
 
-            render_limit_summary(payload["limits"])
+            render_limit_summary(
+                chart_df=payload["chart_df"],
+                limits=payload["limits"],
+                split_by_structure=split_histograms_by_structure,
+                use_date_labels=True,
+            )
+
             render_violations_section(
                 payload["primary_violations"],
                 payload["secondary_violations"],
@@ -2446,16 +2452,24 @@ def render_structural_break_option() -> bool:
         ),
     )
 
-def render_histogram_segment_option() -> bool:
-    """Render sidebar option for histogram behavior per SPC chart."""
-    st.sidebar.subheader("Histogram options")
+def render_histogram_segment_option(enable_structural_break_detection: bool) -> bool:
+    """
+    Render sidebar option for segment-based histogram and limit-summary behavior
+    per SPC chart.
+
+    This section is only shown when automatic structural break detection is enabled.
+    """
+    if not enable_structural_break_detection:
+        return False
+
+    st.sidebar.subheader("Histogram and limit summary options")
     return st.sidebar.checkbox(
-        "Create separate histograms for structural-break segments",
+        "Create separate histograms and limit summaries for structural-break segments",
         value=False,
         help=(
-            "If unticked, one histogram is shown for the full primary-chart series "
-            "displayed in each SPC chart. If ticked, separate histograms are shown "
-            "for each structural segment identified in that chart."
+            "If unticked, each SPC chart shows one histogram and one limit summary "
+            "for the full chart. If ticked, separate histograms and limit summaries "
+            "are shown for each structural segment identified in that chart."
         ),
     )
 
@@ -2602,7 +2616,7 @@ def build_histogram_figure(
 
 
 
-def format_histogram_segment_label(
+def format_segment_label(
     seg_df: pd.DataFrame,
     segment_number: int,
     start_obs: int,
@@ -2721,7 +2735,7 @@ def render_histograms_section(
                 end_obs = end
 
             tab_labels.append(
-                format_histogram_segment_label(
+                format_segment_label(
                     seg_df=seg_df,
                     segment_number=idx,
                     start_obs=start_obs,
@@ -2759,33 +2773,97 @@ def render_histograms_section(
                 st.plotly_chart(fig, use_container_width=True)
 
 
-def render_limit_summary(limits: dict[str, dict[str, Any]]) -> None:
-    """Render a compact summary of the current chart limits inside an expander."""
+def render_limit_summary_metrics_for_segment(
+    segment_summary: dict[str, Any],
+    primary_label: str,
+    secondary_label: str | None,
+) -> None:
+    """Render the limit metrics for one segment."""
+    p1, p2, p3 = st.columns(3)
+    p1.metric(f"{primary_label} CL", format_metric_value(segment_summary.get("primary_CL")))
+    p2.metric(f"{primary_label} UCL", format_metric_value(segment_summary.get("primary_UCL")))
+    p3.metric(f"{primary_label} LCL", format_metric_value(segment_summary.get("primary_LCL")))
+
+    if secondary_label:
+        s1, s2, s3 = st.columns(3)
+        s1.metric(f"{secondary_label} CL", format_metric_value(segment_summary.get("secondary_CL")))
+        s2.metric(f"{secondary_label} UCL", format_metric_value(segment_summary.get("secondary_UCL")))
+        s3.metric(f"{secondary_label} LCL", format_metric_value(segment_summary.get("secondary_LCL")))
+
+
+def render_limit_summary(
+    chart_df: pd.DataFrame,
+    limits: dict[str, dict[str, Any]],
+    split_by_structure: bool,
+    use_date_labels: bool = False,
+) -> None:
+    """Render limit summary, optionally split into tabs by structural segment."""
     primary = limits["primary"]
     secondary = limits["secondary"]
     segment_summaries = limits.get("segment_summaries", [])
+    segment_ranges = limits.get("segment_ranges", [(0, len(chart_df))])
 
     with st.expander("Limit Summary", expanded=False):
-        if len(segment_summaries) > 1:
-            st.caption(
-                f"{len(segment_summaries)} structural segments detected. "
-                f"The metrics below reflect the most recent segment."
+        # Default single-summary behavior
+        if (not split_by_structure) or len(segment_ranges) <= 1 or len(segment_summaries) <= 1:
+            if len(segment_summaries) > 1:
+                st.caption(
+                    f"{len(segment_summaries)} structural segments detected. "
+                    f"The metrics below reflect the most recent segment."
+                )
+
+            # Use the chart-level scalar values (current behavior)
+            p1, p2, p3 = st.columns(3)
+            p1.metric(f"{primary['label']} CL", format_metric_value(primary["CL"]))
+            p2.metric(f"{primary['label']} UCL", format_metric_value(primary["UCL"]))
+            p3.metric(f"{primary['label']} LCL", format_metric_value(primary["LCL"]))
+
+            if secondary:
+                s1, s2, s3 = st.columns(3)
+                s1.metric(f"{secondary['label']} CL", format_metric_value(secondary["CL"]))
+                s2.metric(f"{secondary['label']} UCL", format_metric_value(secondary["UCL"]))
+                s3.metric(f"{secondary['label']} LCL", format_metric_value(secondary["LCL"]))
+
+            return
+
+        # Segmented-tab behavior
+        st.caption("Select a structural segment tab to view that segment’s limit summary.")
+
+        tab_labels = []
+        for idx, (start, end) in enumerate(segment_ranges, start=1):
+            seg_df = chart_df.iloc[start:end].copy()
+
+            if idx <= len(segment_summaries):
+                seg_summary = segment_summaries[idx - 1]
+                start_obs = int(seg_summary["start_obs"])
+                end_obs = int(seg_summary["end_obs"])
+            else:
+                start_obs = start + 1
+                end_obs = end
+
+            tab_labels.append(
+                format_segment_label(
+                    seg_df=seg_df,
+                    segment_number=idx,
+                    start_obs=start_obs,
+                    end_obs=end_obs,
+                    use_date_labels=use_date_labels,
+                )
             )
 
-        p1, p2, p3 = st.columns(3)
-        p1.metric(f"{primary['label']} CL", format_metric_value(primary["CL"]))
-        p2.metric(f"{primary['label']} UCL", format_metric_value(primary["UCL"]))
-        p3.metric(f"{primary['label']} LCL", format_metric_value(primary["LCL"]))
+        tabs = st.tabs(tab_labels)
 
-        if secondary:
-            s1, s2, s3 = st.columns(3)
-            s1.metric(f"{secondary['label']} CL", format_metric_value(secondary["CL"]))
-            s2.metric(f"{secondary['label']} UCL", format_metric_value(secondary["UCL"]))
-            s3.metric(f"{secondary['label']} LCL", format_metric_value(secondary["LCL"]))
-
-        if len(segment_summaries) > 1:
-            with st.expander("Segment-by-segment limits", expanded=False):
-                st.dataframe(pd.DataFrame(segment_summaries), use_container_width=True)
+        for idx, tab in enumerate(tabs, start=1):
+            with tab:
+                if idx <= len(segment_summaries):
+                    seg_summary = segment_summaries[idx - 1]
+                    render_limit_summary_metrics_for_segment(
+                        segment_summary=seg_summary,
+                        primary_label=primary["label"],
+                        secondary_label=secondary["label"] if secondary else None,
+                    )
+                else:
+                    st.info("No segment limit summary is available for this tab.")
 
 
 def build_rule_break_counts_df(violations_df: pd.DataFrame) -> pd.DataFrame:
@@ -2954,7 +3032,13 @@ def run_imr_flow(
         scale_segmented_histograms=scale_segmented_histograms,
     )
 
-    render_limit_summary(limits)
+    render_limit_summary(
+        chart_df=chart_df,
+        limits=limits,
+        split_by_structure=split_histograms_by_structure,
+        use_date_labels=bool(date_col),
+    )
+
     render_violations_section(primary_violations, secondary_violations)
 
     if date_col:
@@ -3016,7 +3100,13 @@ def run_xbar_r_flow(
         scale_segmented_histograms=scale_segmented_histograms,
     )
 
-    render_limit_summary(limits)
+    render_limit_summary(
+        chart_df=chart_df,
+        limits=limits,
+        split_by_structure=split_histograms_by_structure,
+        use_date_labels=False,
+    )
+
     render_violations_section(primary_violations, secondary_violations)
 
 
@@ -3066,7 +3156,13 @@ def run_xbar_s_flow(
         scale_segmented_histograms=scale_segmented_histograms,
     )
 
-    render_limit_summary(limits)
+    render_limit_summary(
+        chart_df=chart_df,
+        limits=limits,
+        split_by_structure=split_histograms_by_structure,
+        use_date_labels=False,
+    )
+
     render_violations_section(primary_violations, secondary_violations)
 
 
@@ -3092,10 +3188,14 @@ def main() -> None:
     null_treatment = render_null_treatment_option()
     enable_structural_break_detection = render_structural_break_option()
 
-    split_histograms_by_structure = render_histogram_segment_option()
+    split_histograms_by_structure = render_histogram_segment_option(
+        enable_structural_break_detection=enable_structural_break_detection
+    )
+
     scale_segmented_histograms = render_histogram_scaling_option(
-            split_histograms_by_structure=split_histograms_by_structure
-        )
+        split_histograms_by_structure=split_histograms_by_structure
+    )
+
     
     if measurement_col is None:
         st.info("Please select a Measurement column to continue.")
