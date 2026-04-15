@@ -17,8 +17,9 @@ from plotly.subplots import make_subplots
 # ============================================================
 APP_TITLE = "📈 SPC App: I‑MR, Xbar‑R, Xbar‑S"
 APP_SUBTITLE = (
-    "Upload your data, map columns, auto-detect valid charts, and visualize SPC rule "
-    "detections with consistent indicators and review-friendly outputs."
+    "Use this app to upload your data, choose the relevant columns, and create SPC charts "
+    "to monitor process behaviour over time. The app highlights possible special-cause "
+    "signals and helps you review control limits and rule-break summaries."
 )
 
 st.set_page_config(
@@ -123,6 +124,16 @@ NULL_TREATMENT_OPTIONS = {
 BACKTRACK_OPTIONS = {
     "Backtrack over all periods": "all_periods",
     "Backtrack for the same period": "same_period",
+}
+
+STRUCTURAL_BREAK_DEFAULTS = {
+    "min_history": 25,              # baseline length used to estimate segment mean/std
+    "mean_allowance": 0.50,         # k for standardized mean CUSUM
+    "mean_decision_interval": 5.0,  # h for mean CUSUM
+    "var_allowance": 0.25,          # k for variance CUSUM on (z^2 - 1)
+    "var_decision_interval": 6.0,   # h for variance CUSUM
+    "confirmations": 2,             # number of consecutive alarming points to confirm a break
+    "min_segment_length": 15,       # minimum number of observations allowed in any segment
 }
 
 # ============================================================
@@ -726,6 +737,343 @@ def detect_secondary_limit_breaches(
 
 
 # ============================================================
+# Sequential Structural Break Detection (Joint / Adaptive CUSUM)
+# ============================================================
+def _estimate_segment_baseline(
+    values: np.ndarray,
+    start: int,
+    baseline_end: int,
+) -> tuple[float, float] | None:
+    """
+    Estimate the in-control baseline (mean, std) for the current segment using
+    the first part of that segment only.
+
+    Returns:
+        (mu0, sigma0) if enough valid data exist, else None
+    """
+    baseline = values[start:baseline_end]
+    baseline = baseline[~np.isnan(baseline)]
+
+    if len(baseline) < 2:
+        return None
+
+    mu0 = float(np.mean(baseline))
+    sigma0 = float(np.std(baseline, ddof=1))
+
+    if not np.isfinite(sigma0) or sigma0 <= 1e-8:
+        sigma0 = 1e-8
+
+    return mu0, sigma0
+
+
+def detect_structural_breaks_sequential(
+    values: pd.Series | np.ndarray,
+    min_history: int = STRUCTURAL_BREAK_DEFAULTS["min_history"],
+    mean_allowance: float = STRUCTURAL_BREAK_DEFAULTS["mean_allowance"],
+    mean_decision_interval: float = STRUCTURAL_BREAK_DEFAULTS["mean_decision_interval"],
+    var_allowance: float = STRUCTURAL_BREAK_DEFAULTS["var_allowance"],
+    var_decision_interval: float = STRUCTURAL_BREAK_DEFAULTS["var_decision_interval"],
+    confirmations: int = STRUCTURAL_BREAK_DEFAULTS["confirmations"],
+    min_segment_length: int = STRUCTURAL_BREAK_DEFAULTS["min_segment_length"],
+) -> list[int]:
+    """
+    Detect structural breaks sequentially using a joint/adaptive CUSUM-type method.
+
+    Method:
+    - The first `min_history` observations in each segment estimate the baseline mean/std.
+    - Thereafter, four tabular CUSUMs are updated sequentially:
+        1) mean shift upward
+        2) mean shift downward
+        3) variance shift upward
+        4) variance shift downward
+    - A break is confirmed only after `confirmations` consecutive alarming points.
+    - After a break, a fresh segment begins and a new baseline is estimated.
+
+    Notes:
+    - Uses only past and present values (no future leakage).
+    - Returns 0-based indices marking the first point of each new segment.
+    """
+    arr = pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(dtype=float)
+    n = len(arr)
+
+    if n < max(min_history + 1, min_segment_length + 1):
+        return []
+
+    breaks: list[int] = []
+    segment_start = 0
+
+    while segment_start + min_history < n:
+        baseline_end = segment_start + min_history
+        baseline = _estimate_segment_baseline(arr, segment_start, baseline_end)
+
+        if baseline is None:
+            break
+
+        mu0, sigma0 = baseline
+
+        # Two-sided mean CUSUMs
+        c_mean_pos = 0.0
+        c_mean_neg = 0.0
+
+        # Two-sided variance CUSUMs
+        c_var_pos = 0.0
+        c_var_neg = 0.0
+
+        # Consecutive alarm tracking for confirmation
+        alarm_streak = 0
+        first_alarm_idx: int | None = None
+
+        break_confirmed = False
+
+        for t in range(baseline_end, n):
+            x_t = arr[t]
+
+            if pd.isna(x_t):
+                alarm_streak = 0
+                first_alarm_idx = None
+                continue
+
+            # Standardized residual relative to the current segment baseline
+            z_t = (x_t - mu0) / sigma0
+
+            # -------------------------
+            # Mean CUSUM (two-sided)
+            # -------------------------
+            c_mean_pos = max(0.0, c_mean_pos + z_t - mean_allowance)
+            c_mean_neg = max(0.0, c_mean_neg - z_t - mean_allowance)
+
+            # -------------------------
+            # Variance CUSUM (two-sided)
+            # Monitor departures of z^2 from 1
+            # -------------------------
+            v_t = (z_t ** 2) - 1.0
+            c_var_pos = max(0.0, c_var_pos + v_t - var_allowance)
+            c_var_neg = max(0.0, c_var_neg - v_t - var_allowance)
+
+            mean_alarm = (
+                c_mean_pos >= mean_decision_interval or
+                c_mean_neg >= mean_decision_interval
+            )
+            var_alarm = (
+                c_var_pos >= var_decision_interval or
+                c_var_neg >= var_decision_interval
+            )
+
+            alarm_now = mean_alarm or var_alarm
+
+            if alarm_now:
+                alarm_streak += 1
+                if first_alarm_idx is None:
+                    first_alarm_idx = t
+            else:
+                alarm_streak = 0
+                first_alarm_idx = None
+
+            if alarm_streak >= confirmations and first_alarm_idx is not None:
+                candidate_break_idx = int(first_alarm_idx)
+
+                # Enforce minimum segment length
+                if (candidate_break_idx - segment_start) >= min_segment_length:
+                    breaks.append(candidate_break_idx)
+                    segment_start = candidate_break_idx
+                    break_confirmed = True
+                    break
+                else:
+                    # Too short to allow a break here; reset evidence and continue
+                    c_mean_pos = 0.0
+                    c_mean_neg = 0.0
+                    c_var_pos = 0.0
+                    c_var_neg = 0.0
+                    alarm_streak = 0
+                    first_alarm_idx = None
+
+        if not break_confirmed:
+            break
+
+    return sorted(set(idx for idx in breaks if 0 < idx < n))
+
+
+def build_segment_ranges(length: int, break_indices: list[int]) -> list[tuple[int, int]]:
+    """Convert break indices into [(start, end), ...] ranges."""
+    valid_breaks = sorted({int(i) for i in break_indices if 0 < int(i) < length})
+    bounds = [0] + valid_breaks + [length]
+    return [(bounds[i], bounds[i + 1]) for i in range(len(bounds) - 1)]
+
+
+def calc_segmented_limits(
+    chart_df: pd.DataFrame,
+    base_calc_func,
+    break_indices: list[int] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """
+    Calculate segment-wise control limits using the existing chart-specific limit logic.
+
+    This preserves the current chart formulas, but applies them independently
+    within each detected segment.
+    """
+    break_indices = break_indices or []
+    n = len(chart_df)
+
+    if n == 0:
+        return base_calc_func(chart_df)
+
+    segment_ranges = build_segment_ranges(n, break_indices)
+
+    if len(segment_ranges) == 1:
+        base_limits = base_calc_func(chart_df)
+        base_limits["break_indices"] = []
+        base_limits["segment_ranges"] = segment_ranges
+        base_limits["segment_summaries"] = [{
+            "segment": 1,
+            "start_obs": 1,
+            "end_obs": n,
+            "primary_CL": base_limits["primary"]["CL"],
+            "primary_UCL": base_limits["primary"]["UCL"],
+            "primary_LCL": base_limits["primary"]["LCL"],
+            "secondary_CL": base_limits["secondary"]["CL"],
+            "secondary_UCL": base_limits["secondary"]["UCL"],
+            "secondary_LCL": base_limits["secondary"]["LCL"],
+        }]
+        return base_limits
+
+    first_seg_limits = base_calc_func(chart_df.iloc[segment_ranges[0][0]:segment_ranges[0][1]].copy())
+
+    segmented_limits = {
+        "primary": {
+            "label": first_seg_limits["primary"]["label"],
+            "y_col": first_seg_limits["primary"]["y_col"],
+            "CL": first_seg_limits["primary"]["CL"],
+            "UCL": first_seg_limits["primary"]["UCL"],
+            "LCL": first_seg_limits["primary"]["LCL"],
+            "CL_series": np.full(n, np.nan, dtype=float),
+            "UCL_series": np.full(n, np.nan, dtype=float),
+            "LCL_series": np.full(n, np.nan, dtype=float),
+            "sigma": first_seg_limits["primary"]["sigma"],
+            "sigma_series": (
+                np.full(n, np.nan, dtype=float)
+                if first_seg_limits["primary"]["sigma_series"] is not None
+                else None
+            ),
+        },
+        "secondary": {
+            "label": first_seg_limits["secondary"]["label"],
+            "y_col": first_seg_limits["secondary"]["y_col"],
+            "CL": first_seg_limits["secondary"]["CL"],
+            "UCL": first_seg_limits["secondary"]["UCL"],
+            "LCL": first_seg_limits["secondary"]["LCL"],
+            "CL_series": np.full(n, np.nan, dtype=float),
+            "UCL_series": np.full(n, np.nan, dtype=float),
+            "LCL_series": np.full(n, np.nan, dtype=float),
+            "sigma": first_seg_limits["secondary"]["sigma"],
+            "sigma_series": (
+                np.full(n, np.nan, dtype=float)
+                if first_seg_limits["secondary"]["sigma_series"] is not None
+                else None
+            ),
+        },
+        "break_indices": sorted(set(break_indices)),
+        "segment_ranges": segment_ranges,
+        "segment_summaries": [],
+    }
+
+    last_seg_limits = first_seg_limits
+
+    for seg_no, (start, end) in enumerate(segment_ranges, start=1):
+        seg_df = chart_df.iloc[start:end].copy()
+        seg_limits = base_calc_func(seg_df)
+        seg_len = end - start
+
+        # Primary
+        segmented_limits["primary"]["CL_series"][start:end] = as_array(seg_limits["primary"]["CL_series"], seg_len)
+        segmented_limits["primary"]["UCL_series"][start:end] = as_array(seg_limits["primary"]["UCL_series"], seg_len)
+        segmented_limits["primary"]["LCL_series"][start:end] = as_array(seg_limits["primary"]["LCL_series"], seg_len)
+        if segmented_limits["primary"]["sigma_series"] is not None and seg_limits["primary"]["sigma_series"] is not None:
+            segmented_limits["primary"]["sigma_series"][start:end] = as_array(seg_limits["primary"]["sigma_series"], seg_len)
+
+        # Secondary
+        segmented_limits["secondary"]["CL_series"][start:end] = as_array(seg_limits["secondary"]["CL_series"], seg_len)
+        segmented_limits["secondary"]["UCL_series"][start:end] = as_array(seg_limits["secondary"]["UCL_series"], seg_len)
+        segmented_limits["secondary"]["LCL_series"][start:end] = as_array(seg_limits["secondary"]["LCL_series"], seg_len)
+        if segmented_limits["secondary"]["sigma_series"] is not None and seg_limits["secondary"]["sigma_series"] is not None:
+            segmented_limits["secondary"]["sigma_series"][start:end] = as_array(seg_limits["secondary"]["sigma_series"], seg_len)
+
+        segmented_limits["segment_summaries"].append(
+            {
+                "segment": seg_no,
+                "start_obs": start + 1,
+                "end_obs": end,
+                "primary_CL": seg_limits["primary"]["CL"],
+                "primary_UCL": seg_limits["primary"]["UCL"],
+                "primary_LCL": seg_limits["primary"]["LCL"],
+                "secondary_CL": seg_limits["secondary"]["CL"],
+                "secondary_UCL": seg_limits["secondary"]["UCL"],
+                "secondary_LCL": seg_limits["secondary"]["LCL"],
+            }
+        )
+
+        last_seg_limits = seg_limits
+
+    # Use the most recent segment's scalar limits for summary metrics
+    segmented_limits["primary"]["CL"] = last_seg_limits["primary"]["CL"]
+    segmented_limits["primary"]["UCL"] = last_seg_limits["primary"]["UCL"]
+    segmented_limits["primary"]["LCL"] = last_seg_limits["primary"]["LCL"]
+    segmented_limits["primary"]["sigma"] = last_seg_limits["primary"]["sigma"]
+
+    segmented_limits["secondary"]["CL"] = last_seg_limits["secondary"]["CL"]
+    segmented_limits["secondary"]["UCL"] = last_seg_limits["secondary"]["UCL"]
+    segmented_limits["secondary"]["LCL"] = last_seg_limits["secondary"]["LCL"]
+    segmented_limits["secondary"]["sigma"] = last_seg_limits["secondary"]["sigma"]
+
+    return segmented_limits
+
+
+def get_limits_with_optional_structural_breaks(
+    chart_df: pd.DataFrame,
+    chart_type: str,
+    enable_structural_break_detection: bool,
+) -> tuple[pd.DataFrame, dict[str, dict[str, Any]]]:
+    """
+    Return chart_df (possibly adjusted) and control limits.
+    If enabled, limits are recalculated segment-by-segment after sequential break detection.
+    """
+    calc_map = {
+        "I-MR": calc_limits_imr,
+        "Xbar-R": calc_limits_xbar_r,
+        "Xbar-S": calc_limits_xbar_s,
+    }
+    primary_col_map = {
+        "I-MR": "value",
+        "Xbar-R": "xbar",
+        "Xbar-S": "xbar",
+    }
+
+    if chart_type not in calc_map:
+        raise ValueError(f"Unsupported chart_type: {chart_type}")
+
+    working_chart_df = chart_df.copy()
+    break_indices: list[int] = []
+
+    if enable_structural_break_detection:
+        break_indices = detect_structural_breaks_sequential(
+            working_chart_df[primary_col_map[chart_type]].to_numpy()
+        )
+
+        # For I-MR, the first MR in each new segment must not bridge across regimes
+        if chart_type == "I-MR" and break_indices:
+            valid_breaks = [idx for idx in break_indices if 0 <= idx < len(working_chart_df)]
+            if valid_breaks:
+                working_chart_df.loc[valid_breaks, "MR"] = np.nan
+
+    limits = calc_segmented_limits(
+        chart_df=working_chart_df,
+        base_calc_func=calc_map[chart_type],
+        break_indices=break_indices,
+    )
+
+    return working_chart_df, limits
+
+
+# ============================================================
 # Chart Data Builders
 # ============================================================
 @st.cache_data(show_spinner=False)
@@ -923,6 +1271,35 @@ def calc_limits_xbar_s(chart_df: pd.DataFrame) -> dict[str, dict[str, Any]]:
 # ============================================================
 # Plot Helpers
 # ============================================================
+def apply_plot_line_gaps(line_values: np.ndarray, break_positions: list[int] | None = None) -> np.ndarray:
+    """Insert NaN at break positions so plotted lines visually split across segments."""
+    arr = np.asarray(line_values, dtype=float).copy()
+    if break_positions:
+        for idx in break_positions:
+            if 0 <= idx < len(arr):
+                arr[idx] = np.nan
+    return arr
+
+
+def add_structural_break_lines(
+    fig: go.Figure,
+    break_x_values: list[Any],
+    rows: list[int],
+    col: int = 1,
+) -> None:
+    """Add vertical dashed lines marking structural breaks."""
+    for x_val in break_x_values:
+        for row in rows:
+            fig.add_vline(
+                x=x_val,
+                line_width=1.5,
+                line_dash="dash",
+                line_color="#1E90FF",
+                opacity=0.85,
+                row=row,
+                col=col,
+            )
+
 def add_limit_lines(
     fig: go.Figure,
     x_values: pd.Series | np.ndarray,
@@ -933,18 +1310,24 @@ def add_limit_lines(
     row: int,
     col: int,
     show_legend_once: bool = False,
+    break_positions: list[int] | None = None,
 ) -> None:
     """Add center line, sigma reference lines, and control limits to a subplot."""
     n = len(x_values)
     cl_arr = as_array(cl, n)
     ucl_arr = as_array(ucl, n)
     lcl_arr = as_array(lcl, n)
+    sigma_arr = as_array(sigma, n)
+
+    plot_cl_arr = apply_plot_line_gaps(cl_arr, break_positions)
+    plot_ucl_arr = apply_plot_line_gaps(ucl_arr, break_positions)
+    plot_lcl_arr = apply_plot_line_gaps(lcl_arr, break_positions)
 
     # Center Line
     fig.add_trace(
         go.Scatter(
             x=x_values,
-            y=cl_arr,
+            y=plot_cl_arr,
             mode="lines",
             name="Center Line",
             legendgroup="center_line",
@@ -955,16 +1338,17 @@ def add_limit_lines(
         col=col,
     )
 
-    # Sigma Reference Lines (visual only; based on mean sigma)
-    sigma_arr = as_array(sigma, n)
+    # Sigma Reference Lines (segment-aware)
     if not np.all(np.isnan(sigma_arr)) and np.nanmax(np.abs(sigma_arr)) != 0:
-        sigma_ref = float(np.nanmean(sigma_arr))
-        cl_ref = float(np.nanmean(cl_arr))
+        upper_1_arr = cl_arr + sigma_arr
+        lower_1_arr = cl_arr - sigma_arr
+        upper_2_arr = cl_arr + 2 * sigma_arr
+        lower_2_arr = cl_arr - 2 * sigma_arr
 
-        upper_1_arr = repeat_line(cl_ref + sigma_ref, n)
-        lower_1_arr = repeat_line(cl_ref - sigma_ref, n)
-        upper_2_arr = repeat_line(cl_ref + 2 * sigma_ref, n)
-        lower_2_arr = repeat_line(cl_ref - 2 * sigma_ref, n)
+        upper_1_arr = apply_plot_line_gaps(upper_1_arr, break_positions)
+        lower_1_arr = apply_plot_line_gaps(lower_1_arr, break_positions)
+        upper_2_arr = apply_plot_line_gaps(upper_2_arr, break_positions)
+        lower_2_arr = apply_plot_line_gaps(lower_2_arr, break_positions)
 
         sigma_line_color = "#6A5ACD"
 
@@ -1025,7 +1409,7 @@ def add_limit_lines(
     fig.add_trace(
         go.Scatter(
             x=x_values,
-            y=ucl_arr,
+            y=plot_ucl_arr,
             mode="lines",
             name="Upper Control Limit",
             legendgroup="ucl",
@@ -1038,7 +1422,7 @@ def add_limit_lines(
     fig.add_trace(
         go.Scatter(
             x=x_values,
-            y=lcl_arr,
+            y=plot_lcl_arr,
             mode="lines",
             name="Lower Control Limit",
             legendgroup="lcl",
@@ -1317,6 +1701,7 @@ def plot_spc_chart(
     """Create the SPC chart figure with primary and secondary subplots."""
     primary = limits["primary"]
     secondary = limits["secondary"]
+    break_indices = limits.get("break_indices", [])
 
     if x_axis_mode == "Time":
         x_col = "date"
@@ -1340,6 +1725,13 @@ def plot_spc_chart(
             f"{secondary['label']} Chart" if secondary else "",
         ),
     )
+
+    # Resolve x values for break lines
+    break_x_values = [
+        chart_df.iloc[idx][x_col]
+        for idx in break_indices
+        if 0 <= idx < len(chart_df)
+    ]
 
     # Primary series
     fig.add_trace(
@@ -1367,6 +1759,7 @@ def plot_spc_chart(
         row=1,
         col=1,
         show_legend_once=True,
+        break_positions=break_indices,
     )
 
     legend_shown_rules: set[str] = set()
@@ -1386,6 +1779,14 @@ def plot_spc_chart(
     # Secondary series
     if secondary is not None:
         sec_df = chart_df.dropna(subset=[secondary["y_col"]]).copy()
+        sec_idx = sec_df.index.to_numpy()
+
+        # First available point at/after each break for visual line splitting
+        secondary_break_positions: list[int] = []
+        for break_idx in break_indices:
+            local_pos = next((pos for pos, orig_idx in enumerate(sec_idx) if orig_idx >= break_idx), None)
+            if local_pos is not None:
+                secondary_break_positions.append(local_pos)
 
         fig.add_trace(
             go.Scatter(
@@ -1405,13 +1806,18 @@ def plot_spc_chart(
         add_limit_lines(
             fig=fig,
             x_values=sec_df[x_col],
-            cl=secondary["CL_series"][: len(sec_df)],
-            ucl=secondary["UCL_series"][: len(sec_df)],
-            lcl=secondary["LCL_series"][: len(sec_df)],
-            sigma=secondary["sigma_series"][: len(sec_df)] if secondary["sigma_series"] is not None else None,
+            cl=np.asarray(secondary["CL_series"], dtype=float)[sec_idx],
+            ucl=np.asarray(secondary["UCL_series"], dtype=float)[sec_idx],
+            lcl=np.asarray(secondary["LCL_series"], dtype=float)[sec_idx],
+            sigma=(
+                np.asarray(secondary["sigma_series"], dtype=float)[sec_idx]
+                if secondary["sigma_series"] is not None
+                else None
+            ),
             row=2,
             col=1,
             show_legend_once=False,
+            break_positions=secondary_break_positions,
         )
 
         add_rule_markers(
@@ -1426,6 +1832,10 @@ def plot_spc_chart(
             x_axis_mode=x_axis_mode,
             default_visible_rule=default_visible_rule,
         )
+
+    # Structural break lines on both subplots
+    if break_x_values:
+        add_structural_break_lines(fig, break_x_values=break_x_values, rows=[1, 2], col=1)
 
     fig.update_layout(
         height=PLOT_HEIGHT,
@@ -1561,12 +1971,21 @@ def detect_violations_for_chart(
 
     secondary_col = limits["secondary"]["y_col"]
     sec_df = chart_df.dropna(subset=[secondary_col]).copy()
-    secondary_violations = detect_secondary_limit_breaches(
-        sec_df,
-        y_col=secondary_col,
-        ucl=limits["secondary"]["UCL_series"][: len(sec_df)],
-        lcl=limits["secondary"]["LCL_series"][: len(sec_df)],
-    )
+
+    if sec_df.empty:
+        secondary_violations = empty_violations_df()
+    else:
+        sec_idx = sec_df.index.to_numpy()
+        ucl_sec = np.asarray(limits["secondary"]["UCL_series"], dtype=float)[sec_idx]
+        lcl_sec = np.asarray(limits["secondary"]["LCL_series"], dtype=float)[sec_idx]
+
+        secondary_violations = detect_secondary_limit_breaches(
+            sec_df,
+            y_col=secondary_col,
+            ucl=ucl_sec,
+            lcl=lcl_sec,
+        )
+
     return primary_violations, secondary_violations
 
 
@@ -1624,7 +2043,9 @@ def get_imr_period_chart_payloads(
     requested_count: int,
     backtrack_mode: str = "all_periods",
     focus_value: int | None = None,
+    enable_structural_break_detection: bool = False,
 ) -> list[dict[str, Any]]:
+
     """
     Build chart payloads for requested additional periods.
 
@@ -1673,8 +2094,13 @@ def get_imr_period_chart_payloads(
             )
             continue
 
-        limits = calc_limits_imr(chart_df)
+        chart_df, limits = get_limits_with_optional_structural_breaks(
+            chart_df=chart_df,
+            chart_type="I-MR",
+            enable_structural_break_detection=enable_structural_break_detection,
+        )
         primary_violations, secondary_violations = detect_violations_for_chart(chart_df, limits)
+
 
         fig = plot_spc_chart(
             chart_df=chart_df,
@@ -1691,6 +2117,7 @@ def get_imr_period_chart_payloads(
                 "period": period,
                 "period_label": format_period_label(period, granularity),
                 "status": "ready",
+                "chart_df": chart_df,
                 "fig": fig,
                 "limits": limits,
                 "primary_violations": primary_violations,
@@ -1822,6 +2249,9 @@ def render_imr_periodic_charts(
     measurement_col: str,
     date_col: str,
     period_requests: dict[str, dict[str, Any]],
+    enable_structural_break_detection: bool,
+    split_histograms_by_structure: bool,
+    scale_segmented_histograms: bool,
 ) -> None:
     """
     Create additional I-MR charts for selected yearly / quarterly / monthly periods.
@@ -1830,7 +2260,7 @@ def render_imr_periodic_charts(
     - supports backtracking over all periods
     - supports backtracking for the same quarter or month across years
     - each chart is rendered inside its own Streamlit tab
-    - the chart, limit summary, and violation dataframes stay together in the same tab
+    - the chart, limit summary, and rule-break summaries stay together in the same tab
     """
     if not period_requests:
         return
@@ -1846,6 +2276,7 @@ def render_imr_periodic_charts(
             requested_count=int(config["count"]),
             backtrack_mode=str(config["backtrack_mode"]),
             focus_value=config.get("focus_value"),
+            enable_structural_break_detection=enable_structural_break_detection,
         )
         tab_payloads.extend(payloads)
 
@@ -1868,6 +2299,16 @@ def render_imr_periodic_charts(
                 continue
 
             st.plotly_chart(payload["fig"], use_container_width=True)
+
+            render_histograms_section(
+                chart_df=payload["chart_df"],
+                limits=payload["limits"],
+                chart_title=f"I-MR Chart — {payload['period_label']}",
+                split_by_structure=split_histograms_by_structure,
+                use_date_labels=True,
+                scale_segmented_histograms=scale_segmented_histograms,
+            )
+
             render_limit_summary(payload["limits"])
             render_violations_section(
                 payload["primary_violations"],
@@ -1878,10 +2319,45 @@ def render_imr_periodic_charts(
 # ============================================================
 # UI Rendering
 # ============================================================
+def render_spc_explainer() -> None:
+    """Render a plain-language SPC explanation and the rules used in this app."""
+    with st.expander("What is SPC and what rules does this app use?", expanded=False):
+        st.markdown(
+            """
+            **Statistical Process Control (SPC)** is a way of monitoring a process over time
+            to distinguish normal variation from unusual variation that may need attention.
+
+            This app supports:
+            - **I-MR** charts for individual observations
+            - **Xbar-R** charts for subgroup averages and ranges
+            - **Xbar-S** charts for subgroup averages and standard deviations
+
+            The app checks for the following rule signals on the **primary chart**:
+            """
+        )
+
+        primary_rules = [
+            "Rule 1", "Rule 2", "Rule 3", "Rule 4",
+            "Rule 5", "Rule 6", "Rule 7", "Rule 8"
+        ]
+        for rule_name in primary_rules:
+            st.markdown(f"- **{rule_name}**: {RULE_DISPLAY_TEXT[rule_name]}")
+
+        st.markdown(
+            """
+            On the **secondary chart**, the app checks:
+            """
+        )
+        st.markdown(
+            f"- **Secondary chart: point beyond control limit**: "
+            f"{RULE_DISPLAY_TEXT['Secondary chart: point beyond control limit']}"
+        )
+
 def render_header() -> None:
     """Render the app header."""
     st.title(APP_TITLE)
-    st.caption(APP_SUBTITLE)
+    st.markdown(APP_SUBTITLE)
+    render_spc_explainer()
 
 
 def render_sidebar_file_upload() -> Any:
@@ -1894,14 +2370,28 @@ def render_sidebar_file_upload() -> Any:
 
 
 def render_data_preview(df: pd.DataFrame) -> None:
-    """Render dataset preview and summary."""
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Rows", f"{df.shape[0]:,}")
-    col2.metric("Columns", f"{df.shape[1]:,}")
-    col3.metric("Missing cells", f"{int(df.isna().sum().sum()):,}")
-
+    """Render dataset preview only."""
     with st.expander("Preview (first 10 rows)", expanded=False):
         st.dataframe(df.head(10), use_container_width=True)
+
+def render_selected_columns_missing_notice(
+    df: pd.DataFrame,
+    measurement_col: str | None,
+    date_col: str | None,
+    subgroup_col: str | None,
+) -> None:
+    """Show a short notice if selected processing columns contain missing values."""
+    selected_cols = [col for col in [measurement_col, date_col, subgroup_col] if col is not None]
+    if not selected_cols:
+        return
+
+    missing_count = int(df[selected_cols].isna().sum().sum())
+    if missing_count > 0:
+        st.info(
+            f"There {'is' if missing_count == 1 else 'are'} {missing_count:,} missing "
+            f"cell{'s' if missing_count != 1 else ''} in the selected processing column"
+            f"{'s' if len(selected_cols) != 1 else ''}."
+        )
 
 
 def render_column_mapping(df: pd.DataFrame) -> tuple[str | None, str | None, str | None]:
@@ -1942,6 +2432,53 @@ def render_null_treatment_option() -> str:
     )
     return NULL_TREATMENT_OPTIONS[selected_label]
 
+def render_structural_break_option() -> bool:
+    """Render sidebar option for automatic structural break detection."""
+    st.sidebar.subheader("Structural break detection")
+    return st.sidebar.checkbox(
+        "Automatically detect structural breaks and re-baseline chart limits",
+        value=False,
+        help=(
+            "When enabled, the app detects sequential changes in the process mean and/or "
+            "standard deviation using only past and current observations. "
+            "When a break is confirmed, new center lines, control limits, and sigma lines "
+            "are calculated from that break onward."
+        ),
+    )
+
+def render_histogram_segment_option() -> bool:
+    """Render sidebar option for histogram behavior per SPC chart."""
+    st.sidebar.subheader("Histogram options")
+    return st.sidebar.checkbox(
+        "Create separate histograms for structural-break segments",
+        value=False,
+        help=(
+            "If unticked, one histogram is shown for the full primary-chart series "
+            "displayed in each SPC chart. If ticked, separate histograms are shown "
+            "for each structural segment identified in that chart."
+        ),
+    )
+
+
+def render_histogram_scaling_option(split_histograms_by_structure: bool) -> bool:
+    """
+    Render sidebar option for scaling segmented histograms within each chart.
+
+    This option only appears when segmented histograms are enabled.
+    """
+    if not split_histograms_by_structure:
+        return False
+
+    return st.sidebar.checkbox(
+        "Scale segmented histograms within each chart",
+        value=True,
+        help=(
+            "If ticked, segmented histograms for a single SPC chart will use the same "
+            "y-axis scale so they can be compared visually. This applies separately "
+            "to the main chart and to each additional chart."
+        ),
+    )
+
 
 def render_validity_messages(evaluation: ChartEvaluation) -> None:
     """Render chart validity assessment results."""
@@ -1949,46 +2486,350 @@ def render_validity_messages(evaluation: ChartEvaluation) -> None:
     for message in evaluation.messages:
         st.markdown(message)
 
+def get_histogram_bin_count(n: int) -> int:
+    """Choose a reasonable histogram bin count based on sample size."""
+    return max(10, min(40, int(np.sqrt(max(n, 1)))))
+
+
+def compute_scaled_histogram_settings(
+    series_list: list[pd.Series],
+) -> dict[str, Any] | None:
+    """
+    Compute common histogram settings for a group of segmented histograms
+    belonging to one SPC chart.
+
+    Returns a dict containing:
+    - xbins: Plotly histogram bin settings
+    - yaxis_range: common y-axis range
+    - yaxis_dtick: common y-axis tick interval
+
+    If there is not enough valid data, returns None.
+    """
+    cleaned_series = [
+        pd.to_numeric(series, errors="coerce").dropna().to_numpy(dtype=float)
+        for series in series_list
+    ]
+    cleaned_series = [arr for arr in cleaned_series if len(arr) > 0]
+
+    if not cleaned_series:
+        return None
+
+    combined = np.concatenate(cleaned_series)
+    if len(combined) == 0:
+        return None
+
+    x_min = float(np.min(combined))
+    x_max = float(np.max(combined))
+
+    # Handle degenerate case where all values are identical
+    if np.isclose(x_min, x_max):
+        x_min -= 0.5
+        x_max += 0.5
+
+    nbins = get_histogram_bin_count(len(combined))
+    bin_edges = np.linspace(x_min, x_max, nbins + 1)
+    bin_size = float(bin_edges[1] - bin_edges[0])
+
+    max_count = 0
+    for arr in cleaned_series:
+        counts, _ = np.histogram(arr, bins=bin_edges)
+        if len(counts) > 0:
+            max_count = max(max_count, int(np.max(counts)))
+
+    if max_count <= 0:
+        max_count = 1
+
+    # Small headroom above tallest bar
+    y_max = int(np.ceil(max_count * 1.08))
+
+    # Reasonable tick interval
+    y_dtick = max(1, int(np.ceil(y_max / 5)))
+
+    return {
+        "xbins": {
+            "start": x_min,
+            "end": x_max,
+            "size": bin_size,
+        },
+        "yaxis_range": [0, y_max],
+        "yaxis_dtick": y_dtick,
+    }
+
+
+def build_histogram_figure(
+    series: pd.Series,
+    title: str,
+    x_axis_title: str,
+    xbins: dict[str, float] | None = None,
+    yaxis_range: list[float] | None = None,
+    yaxis_dtick: float | None = None,
+) -> go.Figure:
+    """Create a histogram figure for the provided series."""
+    clean = pd.to_numeric(series, errors="coerce").dropna()
+
+    histogram_kwargs = {
+        "x": clean,
+        "marker": dict(color="#5B5B5B"),
+        "opacity": 0.9,
+        "name": x_axis_title,
+    }
+
+    if xbins is None:
+        histogram_kwargs["nbinsx"] = get_histogram_bin_count(len(clean))
+    else:
+        histogram_kwargs["xbins"] = xbins
+
+    fig = go.Figure()
+    fig.add_trace(go.Histogram(**histogram_kwargs))
+
+    fig.update_layout(
+        title=dict(text=title, x=0.5, xanchor="center"),
+        xaxis_title=x_axis_title,
+        yaxis_title="Count",
+        bargap=0.08,
+        height=420,
+        margin=dict(l=40, r=20, t=70, b=40),
+        showlegend=False,
+    )
+
+    if yaxis_range is not None:
+        fig.update_yaxes(range=yaxis_range)
+
+    if yaxis_dtick is not None:
+        fig.update_yaxes(dtick=yaxis_dtick)
+
+    return fig
+
+
+
+def format_histogram_segment_label(
+    seg_df: pd.DataFrame,
+    segment_number: int,
+    start_obs: int,
+    end_obs: int,
+    use_date_labels: bool,
+) -> str:
+    """
+    Build the label for a histogram segment.
+
+    If use_date_labels is True and a real date column is available in the chart_df,
+    label the segment using its date range. Otherwise, fall back to observation numbers.
+    """
+    if use_date_labels and "date" in seg_df.columns:
+        valid_dates = pd.to_datetime(seg_df["date"], errors="coerce").dropna()
+
+        if not valid_dates.empty:
+            start_dt = valid_dates.min()
+            end_dt = valid_dates.max()
+
+            # Date-only formatting if timestamps are normalized, otherwise include time
+            if (
+                start_dt == pd.Timestamp(start_dt).normalize()
+                and end_dt == pd.Timestamp(end_dt).normalize()
+            ):
+                start_label = start_dt.strftime("%Y-%m-%d")
+                end_label = end_dt.strftime("%Y-%m-%d")
+            else:
+                start_label = start_dt.strftime("%Y-%m-%d %H:%M")
+                end_label = end_dt.strftime("%Y-%m-%d %H:%M")
+
+            if start_label == end_label:
+                return f"Segment {segment_number} · {start_label}"
+
+            return f"Segment {segment_number} · {start_label} to {end_label}"
+
+    return f"Segment {segment_number} · Obs {start_obs}–{end_obs}"
+
+
+def render_histograms_section(
+    chart_df: pd.DataFrame,
+    limits: dict[str, dict[str, Any]],
+    chart_title: str,
+    split_by_structure: bool,
+    use_date_labels: bool = False,
+    scale_segmented_histograms: bool = False,
+) -> None:
+    """
+    Render histogram(s) for the primary series shown in the SPC chart.
+
+    Behavior:
+    - If split_by_structure is False: show one histogram for the full primary series
+      displayed in the chart.
+    - If split_by_structure is True and multiple structural segments exist:
+      show one histogram per segment inside tabs within an expander.
+    - If split_by_structure is True but there is only one segment:
+      fall back to a single histogram.
+    """
+    primary = limits["primary"]
+    y_col = primary["y_col"]
+    y_label = primary["label"]
+
+    segment_ranges = limits.get("segment_ranges", [(0, len(chart_df))])
+    segment_summaries = limits.get("segment_summaries", [])
+
+    # Fallback to one histogram if segmentation is not requested or no real split exists
+    if (not split_by_structure) or len(segment_ranges) <= 1:
+        with st.expander(f"Histogram — {chart_title}", expanded=False):
+            clean = pd.to_numeric(chart_df[y_col], errors="coerce").dropna()
+            if clean.empty:
+                st.info("No valid values are available to plot a histogram for this chart.")
+            else:
+                if use_date_labels and "date" in chart_df.columns:
+                    valid_dates = pd.to_datetime(chart_df["date"], errors="coerce").dropna()
+                    if not valid_dates.empty:
+                        start_dt = valid_dates.min()
+                        end_dt = valid_dates.max()
+
+                        if (
+                            start_dt == pd.Timestamp(start_dt).normalize()
+                            and end_dt == pd.Timestamp(end_dt).normalize()
+                        ):
+                            start_label = start_dt.strftime("%Y-%m-%d")
+                            end_label = end_dt.strftime("%Y-%m-%d")
+                        else:
+                            start_label = start_dt.strftime("%Y-%m-%d %H:%M")
+                            end_label = end_dt.strftime("%Y-%m-%d %H:%M")
+
+                        if start_label == end_label:
+                            st.caption(f"Date range: {start_label}")
+                        else:
+                            st.caption(f"Date range: {start_label} to {end_label}")
+
+                fig = build_histogram_figure(
+                    chart_df[y_col],
+                    title=f"{chart_title} — {y_label} Histogram",
+                    x_axis_title=y_label,
+                )
+                st.plotly_chart(fig, use_container_width=True)
+        return
+
+    # Segmented histograms
+    with st.expander(f"Histograms by Structural Segment — {chart_title}", expanded=False):
+        tab_labels = []
+        segment_series_list: list[pd.Series] = []
+
+        for idx, (start, end) in enumerate(segment_ranges, start=1):
+            seg_df = chart_df.iloc[start:end].copy()
+            segment_series_list.append(seg_df[y_col])
+
+            if idx <= len(segment_summaries):
+                seg_summary = segment_summaries[idx - 1]
+                start_obs = int(seg_summary["start_obs"])
+                end_obs = int(seg_summary["end_obs"])
+            else:
+                start_obs = start + 1
+                end_obs = end
+
+            tab_labels.append(
+                format_histogram_segment_label(
+                    seg_df=seg_df,
+                    segment_number=idx,
+                    start_obs=start_obs,
+                    end_obs=end_obs,
+                    use_date_labels=use_date_labels,
+                )
+            )
+
+        scale_settings = None
+        if scale_segmented_histograms and len(segment_ranges) > 1:
+            scale_settings = compute_scaled_histogram_settings(segment_series_list)
+
+        if scale_settings is not None:
+            st.caption("Segmented histograms in this chart use a common y-axis scale.")
+
+        tabs = st.tabs(tab_labels)
+
+        for idx, ((start, end), tab) in enumerate(zip(segment_ranges, tabs), start=1):
+            with tab:
+                seg_df = chart_df.iloc[start:end].copy()
+                clean = pd.to_numeric(seg_df[y_col], errors="coerce").dropna()
+
+                if clean.empty:
+                    st.info("No valid values are available for this structural segment.")
+                    continue
+
+                fig = build_histogram_figure(
+                    seg_df[y_col],
+                    title=f"{chart_title} — {y_label} Histogram (Segment {idx})",
+                    x_axis_title=y_label,
+                    xbins=scale_settings["xbins"] if scale_settings is not None else None,
+                    yaxis_range=scale_settings["yaxis_range"] if scale_settings is not None else None,
+                    yaxis_dtick=scale_settings["yaxis_dtick"] if scale_settings is not None else None,
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
 
 def render_limit_summary(limits: dict[str, dict[str, Any]]) -> None:
-    """Render a compact summary of the current chart limits."""
+    """Render a compact summary of the current chart limits inside an expander."""
     primary = limits["primary"]
     secondary = limits["secondary"]
+    segment_summaries = limits.get("segment_summaries", [])
 
-    st.markdown("### Limit Summary")
+    with st.expander("Limit Summary", expanded=False):
+        if len(segment_summaries) > 1:
+            st.caption(
+                f"{len(segment_summaries)} structural segments detected. "
+                f"The metrics below reflect the most recent segment."
+            )
 
-    p1, p2, p3 = st.columns(3)
-    p1.metric(f"{primary['label']} CL", format_metric_value(primary["CL"]))
-    p2.metric(f"{primary['label']} UCL", format_metric_value(primary["UCL"]))
-    p3.metric(f"{primary['label']} LCL", format_metric_value(primary["LCL"]))
+        p1, p2, p3 = st.columns(3)
+        p1.metric(f"{primary['label']} CL", format_metric_value(primary["CL"]))
+        p2.metric(f"{primary['label']} UCL", format_metric_value(primary["UCL"]))
+        p3.metric(f"{primary['label']} LCL", format_metric_value(primary["LCL"]))
 
-    if secondary:
-        s1, s2, s3 = st.columns(3)
-        s1.metric(f"{secondary['label']} CL", format_metric_value(secondary["CL"]))
-        s2.metric(f"{secondary['label']} UCL", format_metric_value(secondary["UCL"]))
-        s3.metric(f"{secondary['label']} LCL", format_metric_value(secondary["LCL"]))
+        if secondary:
+            s1, s2, s3 = st.columns(3)
+            s1.metric(f"{secondary['label']} CL", format_metric_value(secondary["CL"]))
+            s2.metric(f"{secondary['label']} UCL", format_metric_value(secondary["UCL"]))
+            s3.metric(f"{secondary['label']} LCL", format_metric_value(secondary["LCL"]))
+
+        if len(segment_summaries) > 1:
+            with st.expander("Segment-by-segment limits", expanded=False):
+                st.dataframe(pd.DataFrame(segment_summaries), use_container_width=True)
+
+
+def build_rule_break_counts_df(violations_df: pd.DataFrame) -> pd.DataFrame:
+    """Create a summary table showing number of occurrences per rule break."""
+    if violations_df.empty:
+        return pd.DataFrame(columns=["rule", "occurrences", "rule_description"])
+
+    summary = (
+        violations_df.groupby("rule", as_index=False)
+        .size()
+        .rename(columns={"size": "occurrences"})
+    )
+    summary["rule_description"] = summary["rule"].map(RULE_DISPLAY_TEXT)
+    summary["sort_order"] = summary["rule"].map(lambda x: RULE_SORT_ORDER.get(x, 999))
+
+    return (
+        summary.sort_values(["sort_order", "rule"])
+        .drop(columns=["sort_order"])
+        .reset_index(drop=True)
+    )
 
 
 def render_violations_section(
     primary_violations: pd.DataFrame,
     secondary_violations: pd.DataFrame,
 ) -> None:
-    """Render violation tables."""
-    st.markdown("### Violations")
+    """Render rule-break count summaries inside an expander with tabs."""
+    primary_summary = build_rule_break_counts_df(primary_violations)
+    secondary_summary = build_rule_break_counts_df(secondary_violations)
 
-    tab1, tab2 = st.tabs(["Primary Chart Rules", "Secondary Chart Limit Breaches"])
+    with st.expander("Rule-break Summary", expanded=False):
+        tab1, tab2 = st.tabs(["Primary Chart", "Secondary Chart"])
 
-    with tab1:
-        if primary_violations.empty:
-            st.success("No primary-chart SPC rule violations detected.")
-        else:
-            st.dataframe(primary_violations, use_container_width=True)
+        with tab1:
+            if primary_summary.empty:
+                st.success("No primary-chart SPC rule breaks detected.")
+            else:
+                st.dataframe(primary_summary, use_container_width=True)
 
-    with tab2:
-        if secondary_violations.empty:
-            st.success("No secondary-chart limit breaches detected.")
-        else:
-            st.dataframe(secondary_violations, use_container_width=True)
+        with tab2:
+            if secondary_summary.empty:
+                st.success("No secondary-chart rule breaks detected.")
+            else:
+                st.dataframe(secondary_summary, use_container_width=True)
 
 
 def render_imr_main_date_selector(df_work: pd.DataFrame, date_col: str) -> tuple[pd.Timestamp, pd.Timestamp] | None:
@@ -2045,7 +2886,14 @@ def render_imr_main_date_selector(df_work: pd.DataFrame, date_col: str) -> tuple
 # ============================================================
 # Main Chart Execution
 # ============================================================
-def run_imr_flow(df_work: pd.DataFrame, measurement_col: str, date_col: str | None) -> None:
+def run_imr_flow(
+    df_work: pd.DataFrame,
+    measurement_col: str,
+    date_col: str | None,
+    enable_structural_break_detection: bool,
+    split_histograms_by_structure: bool,
+    scale_segmented_histograms: bool,
+) -> None:
     """Execute I-MR build, limits, violations, and rendering."""
     df_for_main_chart = df_work.copy()
 
@@ -2069,11 +2917,21 @@ def run_imr_flow(df_work: pd.DataFrame, measurement_col: str, date_col: str | No
         if len(df_for_main_chart) < 3:
             st.warning("Fewer than 3 valid observations remain in the selected date range for the main I‑MR chart.")
             st.stop()
+    else:
+        df_for_main_chart = df_for_main_chart.tail(365).copy()
+
+        if len(df_for_main_chart) < 3:
+            st.warning("Fewer than 3 valid observations are available for the main I‑MR chart.")
+            st.stop()
 
     chart_df = build_imr_chart_df(df_for_main_chart, measurement_col=measurement_col, date_col=date_col)
-    limits = calc_limits_imr(chart_df)
-    x_axis_mode = "Time" if date_col else "Index"
+    chart_df, limits = get_limits_with_optional_structural_breaks(
+        chart_df=chart_df,
+        chart_type="I-MR",
+        enable_structural_break_detection=enable_structural_break_detection,
+    )
 
+    x_axis_mode = "Time" if date_col else "Index"
     primary_violations, secondary_violations = detect_violations_for_chart(chart_df, limits)
 
     fig = plot_spc_chart(
@@ -2086,6 +2944,16 @@ def run_imr_flow(df_work: pd.DataFrame, measurement_col: str, date_col: str | No
     )
 
     st.plotly_chart(fig, use_container_width=True)
+    
+    render_histograms_section(
+        chart_df=chart_df,
+        limits=limits,
+        chart_title="I-MR Chart",
+        split_by_structure=split_histograms_by_structure,
+        use_date_labels=bool(date_col),
+        scale_segmented_histograms=scale_segmented_histograms,
+    )
+
     render_limit_summary(limits)
     render_violations_section(primary_violations, secondary_violations)
 
@@ -2096,10 +2964,20 @@ def run_imr_flow(df_work: pd.DataFrame, measurement_col: str, date_col: str | No
             measurement_col=measurement_col,
             date_col=date_col,
             period_requests=period_requests,
+            enable_structural_break_detection=enable_structural_break_detection,
+            split_histograms_by_structure=split_histograms_by_structure,
+            scale_segmented_histograms=scale_segmented_histograms,
         )
 
 
-def run_xbar_r_flow(df_work: pd.DataFrame, measurement_col: str, subgroup_col: str) -> None:
+def run_xbar_r_flow(
+    df_work: pd.DataFrame,
+    measurement_col: str,
+    subgroup_col: str,
+    enable_structural_break_detection: bool,
+    split_histograms_by_structure: bool,
+    scale_segmented_histograms: bool,
+) -> None:
     """Execute Xbar-R build, limits, violations, and rendering."""
     unsupported_sizes = check_unsupported_group_sizes(df_work, measurement_col, subgroup_col)
     if unsupported_sizes:
@@ -2110,7 +2988,12 @@ def run_xbar_r_flow(df_work: pd.DataFrame, measurement_col: str, subgroup_col: s
         st.stop()
 
     chart_df = build_xbar_r_chart_df(df_work, measurement_col=measurement_col, subgroup_col=subgroup_col)
-    limits = calc_limits_xbar_r(chart_df)
+    chart_df, limits = get_limits_with_optional_structural_breaks(
+        chart_df=chart_df,
+        chart_type="Xbar-R",
+        enable_structural_break_detection=enable_structural_break_detection,
+    )
+
     primary_violations, secondary_violations = detect_violations_for_chart(chart_df, limits)
 
     fig = plot_spc_chart(
@@ -2123,11 +3006,28 @@ def run_xbar_r_flow(df_work: pd.DataFrame, measurement_col: str, subgroup_col: s
     )
 
     st.plotly_chart(fig, use_container_width=True)
+
+    render_histograms_section(
+        chart_df=chart_df,
+        limits=limits,
+        chart_title="Xbar–R Chart",
+        split_by_structure=split_histograms_by_structure,
+        use_date_labels=False,
+        scale_segmented_histograms=scale_segmented_histograms,
+    )
+
     render_limit_summary(limits)
     render_violations_section(primary_violations, secondary_violations)
 
 
-def run_xbar_s_flow(df_work: pd.DataFrame, measurement_col: str, subgroup_col: str) -> None:
+def run_xbar_s_flow(
+    df_work: pd.DataFrame,
+    measurement_col: str,
+    subgroup_col: str,
+    enable_structural_break_detection: bool,
+    split_histograms_by_structure: bool,
+    scale_segmented_histograms: bool,
+) -> None:
     """Execute Xbar-S build, limits, violations, and rendering."""
     unsupported_sizes = check_unsupported_group_sizes(df_work, measurement_col, subgroup_col)
     if unsupported_sizes:
@@ -2138,7 +3038,12 @@ def run_xbar_s_flow(df_work: pd.DataFrame, measurement_col: str, subgroup_col: s
         st.stop()
 
     chart_df = build_xbar_s_chart_df(df_work, measurement_col=measurement_col, subgroup_col=subgroup_col)
-    limits = calc_limits_xbar_s(chart_df)
+    chart_df, limits = get_limits_with_optional_structural_breaks(
+        chart_df=chart_df,
+        chart_type="Xbar-S",
+        enable_structural_break_detection=enable_structural_break_detection,
+    )
+
     primary_violations, secondary_violations = detect_violations_for_chart(chart_df, limits)
 
     fig = plot_spc_chart(
@@ -2151,6 +3056,16 @@ def run_xbar_s_flow(df_work: pd.DataFrame, measurement_col: str, subgroup_col: s
     )
 
     st.plotly_chart(fig, use_container_width=True)
+
+    render_histograms_section(
+        chart_df=chart_df,
+        limits=limits,
+        chart_title="Xbar–S Chart",
+        split_by_structure=split_histograms_by_structure,
+        use_date_labels=False,
+        scale_segmented_histograms=scale_segmented_histograms,
+    )
+
     render_limit_summary(limits)
     render_violations_section(primary_violations, secondary_violations)
 
@@ -2169,12 +3084,19 @@ def main() -> None:
         st.info("Upload a CSV or Excel file to get started.")
         return
 
-    st.success(f"Loaded dataset with {df.shape[0]:,} rows and {df.shape[1]:,} columns.")
+    st.success("Dataset loaded successfully.")
     render_data_preview(df)
 
     measurement_col, date_col, subgroup_col = render_column_mapping(df)
+    render_selected_columns_missing_notice(df, measurement_col, date_col, subgroup_col)
     null_treatment = render_null_treatment_option()
+    enable_structural_break_detection = render_structural_break_option()
 
+    split_histograms_by_structure = render_histogram_segment_option()
+    scale_segmented_histograms = render_histogram_scaling_option(
+            split_histograms_by_structure=split_histograms_by_structure
+        )
+    
     if measurement_col is None:
         st.info("Please select a Measurement column to continue.")
         st.stop()
@@ -2213,19 +3135,40 @@ def main() -> None:
     st.subheader("Chart(s) with SPC Rules & Indicators")
 
     if chosen_chart == "I-MR":
-        run_imr_flow(df_work, measurement_col, date_col)
+        run_imr_flow(
+            df_work=df_work,
+            measurement_col=measurement_col,
+            date_col=date_col,
+            enable_structural_break_detection=enable_structural_break_detection,
+            split_histograms_by_structure=split_histograms_by_structure,
+            scale_segmented_histograms=scale_segmented_histograms,
+        )
 
     elif chosen_chart == "Xbar-R":
         if subgroup_col is None:
             st.error("Subgroup column is required for Xbar-R.")
             st.stop()
-        run_xbar_r_flow(df_work, measurement_col, subgroup_col)
+        run_xbar_r_flow(
+            df_work=df_work,
+            measurement_col=measurement_col,
+            subgroup_col=subgroup_col,
+            enable_structural_break_detection=enable_structural_break_detection,
+            split_histograms_by_structure=split_histograms_by_structure,
+            scale_segmented_histograms=scale_segmented_histograms,
+        )
 
     elif chosen_chart == "Xbar-S":
         if subgroup_col is None:
             st.error("Subgroup column is required for Xbar-S.")
             st.stop()
-        run_xbar_s_flow(df_work, measurement_col, subgroup_col)
+        run_xbar_s_flow(
+            df_work=df_work,
+            measurement_col=measurement_col,
+            subgroup_col=subgroup_col,
+            enable_structural_break_detection=enable_structural_break_detection,
+            split_histograms_by_structure=split_histograms_by_structure,
+            scale_segmented_histograms=scale_segmented_histograms,
+        )
 
 
 if __name__ == "__main__":
