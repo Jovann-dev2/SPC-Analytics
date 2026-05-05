@@ -11,11 +11,23 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
+from numpy import linspace, exp, sqrt, pi
+
+from datetime import date, timedelta
+
+# Easter calculation
+from dateutil.easter import easter, EASTER_WESTERN
+
+# Public holidays (optional dependency)
+try:
+    import holidays as pyholidays
+except ImportError:
+    pyholidays = None
 
 # ============================================================
 # Streamlit App Configuration
 # ============================================================
-APP_TITLE = "SPC App: I‑MR, Xbar‑R, Xbar‑S"
+APP_TITLE = "SPC App"
 APP_SUBTITLE = (
     "Use this app to upload your data, choose the relevant columns, and create SPC charts "
     "to monitor process behaviour over time. The app highlights possible special-cause "
@@ -83,10 +95,10 @@ RULE_STYLE_MAP = {
         "color": "#4B4B4B",
         "label": "Secondary limit breach",
     },
-    "Multiple rules": {"color": "#FF0000", "label": "Multiple rules"},
+    "All Rule Breaks": {"color": "#FF0000", "label": "All Rule Breaks"},
 }
 DEFAULT_RULE_STYLE = {"color": "#333333", "label": "Special cause"}
-
+DATE_FMT_D3 = "%d %b %Y"   # 29 Apr 2026  (3-letter month)
 RULE_DISPLAY_TEXT = {
     "Rule 1": "One point is more than 3 standard deviations from the mean.",
     "Rule 2": "Nine (or more) points in a row are on the same side of the mean.",
@@ -97,7 +109,98 @@ RULE_DISPLAY_TEXT = {
     "Rule 7": "Fifteen points in a row are all within 1 standard deviation of the mean on either side of the mean.",
     "Rule 8": "Eight points in a row exist, but none are within 1 standard deviation of the mean, and the points are in both directions from the mean.",
     "Secondary chart: point beyond control limit": "A point on the secondary chart is beyond the control limit.",
+    "All Rule Breaks": "All points where one or more SPC rule breaks occur.",
 }
+
+def get_rule_description_dynamic(
+    rule_name: str,
+    rule_points: dict[str, int],
+    rule_window_threshold: dict[str, dict[str, int]],
+) -> str:
+    """
+    Return a rule description string that reflects the current editable settings.
+    Used for UI display in the rules expander (and optionally elsewhere).
+    """
+    # Fallback to the original text for rules we don't parameterize here
+    base = RULE_DISPLAY_TEXT.get(rule_name, rule_name)
+
+    # Single-parameter rules: "points used" changes the run/window length
+    if rule_name == "Rule 2":
+        n = int(rule_points.get("Rule 2", 9))
+        return f"{n} (or more) points in a row are on the same side of the mean."
+
+    if rule_name == "Rule 3":
+        n = int(rule_points.get("Rule 3", 6))
+        return f"{n} (or more) points in a row are continually increasing (or decreasing)."
+
+    if rule_name == "Rule 4":
+        n = int(rule_points.get("Rule 4", 14))
+        return f"{n} (or more) points in a row alternate in direction, increasing then decreasing."
+
+    if rule_name == "Rule 7":
+        n = int(rule_points.get("Rule 7", 15))
+        return (
+            f"{n} points in a row are all within 1 standard deviation of the mean "
+            f"on either side of the mean."
+        )
+
+    if rule_name == "Rule 8":
+        n = int(rule_points.get("Rule 8", 8))
+        return (
+            f"{n} points in a row exist, but none are within 1 standard deviation of the mean, "
+            f"and the points are in both directions from the mean."
+        )
+
+    # Two-parameter rules: window + threshold
+    if rule_name == "Rule 5":
+        cfg = rule_window_threshold.get("Rule 5", {"window": 3, "threshold": 2})
+        w = max(2, int(cfg.get("window", 3)))
+        t = min(max(1, int(cfg.get("threshold", 2))), w)
+        return (
+            f"{t} (or more) out of {w} points in a row are more than 2 standard deviations "
+            f"from the mean in the same direction."
+        )
+
+    if rule_name == "Rule 6":
+        cfg = rule_window_threshold.get("Rule 6", {"window": 5, "threshold": 4})
+        w = max(2, int(cfg.get("window", 5)))
+        t = min(max(1, int(cfg.get("threshold", 4))), w)
+        return (
+            f"{t} (or more) out of {w} points in a row are more than 1 standard deviation "
+            f"from the mean in the same direction."
+        )
+
+    return base
+
+
+# ---- Editable rule parameters (defaults)
+DEFAULT_RULE_ENABLED = {
+    "Rule 1": True,
+    "Rule 2": True,
+    "Rule 3": True,
+    "Rule 4": False,
+    "Rule 5": False,
+    "Rule 6": False,
+    "Rule 7": False,
+    "Rule 8": False,
+    "Secondary chart: point beyond control limit": True,
+}
+
+# Rules whose "points used" are a single number (run length/window size)
+DEFAULT_RULE_POINTS = {
+    "Rule 2": 7,
+    "Rule 3": 7,
+    "Rule 4": 14,
+    "Rule 7": 15,
+    "Rule 8": 8,
+}
+
+# Rules with BOTH a window and a threshold (count within that window)
+DEFAULT_RULE_WINDOW_THRESHOLD = {
+    "Rule 5": {"window": 3, "threshold": 2},
+    "Rule 6": {"window": 5, "threshold": 4},
+}
+
 RULE_SORT_ORDER = {
     "Rule 1": 1,
     "Rule 2": 2,
@@ -108,7 +211,7 @@ RULE_SORT_ORDER = {
     "Rule 7": 7,
     "Rule 8": 8,
     "Secondary chart: point beyond control limit": 9,
-    "Multiple rules": 10,
+    "All Rule Breaks": 10,
 }
 
 SUPPORTED_UPLOAD_TYPES = ["csv", "xlsx", "xls"]
@@ -207,8 +310,7 @@ def as_array(values: Any, length: int) -> np.ndarray:
 
 def empty_violations_df() -> pd.DataFrame:
     """Return a standard empty violations DataFrame."""
-    return pd.DataFrame(columns=["date", "rule", "value", "rule_description"])
-
+    return pd.DataFrame(columns=["date", "rule", "value", "rule_description", "count_as_break"])
 
 def format_metric_value(value: float | int | None, decimals: int = 5) -> str:
     """Format a numeric metric for UI display."""
@@ -259,6 +361,138 @@ def date_range_to_full_day_bounds(start_date: Any, end_date: Any) -> tuple[pd.Ti
 
 
 @st.cache_data(show_spinner=False)
+def build_holiday_calendar(
+    start_dt: pd.Timestamp,
+    end_dt: pd.Timestamp,
+    country_code: str = "ZA",
+    subdiv: str | None = None,
+    observed: bool = True,
+    christmas_start_md: tuple[int, int] = (12, 24),
+    christmas_end_md: tuple[int, int] = (1, 6),
+    easter_week_mode: str = "iso_week",  # "iso_week" or "goodfri_to_mon"
+) -> pd.DataFrame:
+    """
+    Build a calendar of dates between start_dt and end_dt with holiday flags.
+    Returns a DataFrame with:
+      - date
+      - is_public_holiday, public_holiday_name
+      - is_christmas_holiday
+      - is_easter_week
+      - holiday_type (public/christmas/easter_week/none)
+    """
+
+    start_dt = pd.Timestamp(start_dt).normalize()
+    end_dt = pd.Timestamp(end_dt).normalize()
+
+    all_days = pd.date_range(start_dt, end_dt, freq="D")
+    cal = pd.DataFrame({"date": all_days})
+
+    # -------- Public holidays
+    pub_names = {}
+    if pyholidays is not None:
+        years = range(start_dt.year, end_dt.year + 1)
+        hdays = pyholidays.country_holidays(country_code, years=years, subdiv=subdiv, observed=observed)
+        # dict-like: keys are date objects; values are holiday names
+        pub_names = {pd.Timestamp(d): name for d, name in hdays.items()}
+    else:
+        # If library missing, leave empty (but app can warn)
+        pub_names = {}
+
+    cal["public_holiday_name"] = cal["date"].map(pub_names)
+    cal["is_public_holiday"] = cal["public_holiday_name"].notna()
+
+    # -------- Christmas holiday window (spans year boundary)
+    # Example default: Dec 24 -> Jan 6
+    christmas_dates = set()
+    for y in range(start_dt.year - 1, end_dt.year + 1):
+        start = pd.Timestamp(date(y, christmas_start_md[0], christmas_start_md[1]))
+        # end is in following year if month/day is Jan...
+        end_year = y if christmas_end_md[0] >= christmas_start_md[0] else y + 1
+        end = pd.Timestamp(date(end_year, christmas_end_md[0], christmas_end_md[1]))
+        for d in pd.date_range(start, end, freq="D"):
+            christmas_dates.add(pd.Timestamp(d).normalize())
+
+    cal["is_christmas_holiday"] = cal["date"].isin(christmas_dates)
+
+    # -------- Easter week
+    easter_week_dates = set()
+    for y in range(start_dt.year, end_dt.year + 1):
+        easter_sun = pd.Timestamp(easter(y, method=EASTER_WESTERN))
+
+        if easter_week_mode == "goodfri_to_mon":
+            # Good Friday (Sun-2) through Easter Monday (Sun+1)
+            start = easter_sun - pd.Timedelta(days=2)
+            end = easter_sun + pd.Timedelta(days=1)
+        else:
+            # ISO week containing Easter Sunday (Mon..Sun)
+            start = easter_sun - pd.Timedelta(days=int(easter_sun.weekday()))  # Monday
+            end = start + pd.Timedelta(days=6)
+
+        for d in pd.date_range(start.normalize(), end.normalize(), freq="D"):
+            easter_week_dates.add(pd.Timestamp(d).normalize())
+
+    cal["is_easter_week"] = cal["date"].isin(easter_week_dates)
+
+    # -------- A simple categorical label (useful for saving/export)
+    def _label_row(r):
+        if r["is_public_holiday"]:
+            return "public_holiday"
+        if r["is_christmas_holiday"]:
+            return "christmas_holiday"
+        if r["is_easter_week"]:
+            return "easter_week"
+        return "none"
+
+    cal["holiday_type"] = cal.apply(_label_row, axis=1)
+    return cal
+
+
+def save_holiday_calendar_to_session(holiday_df: pd.DataFrame) -> None:
+    """Store holiday calendar in session_state."""
+    st.session_state["holiday_calendar_df"] = holiday_df.copy()
+
+
+@st.cache_data(show_spinner=False)
+def fill_missing_dates_with_zero(
+    df: pd.DataFrame,
+    date_col: str,
+    measurement_col: str,
+    freq: str = "D",
+    agg: str = "sum",
+) -> tuple[pd.DataFrame, pd.DatetimeIndex]:
+    """
+    Ensures every date in [min(date), max(date)] exists.
+    Missing dates get measurement=0.
+    Returns (new_df, missing_dates_index).
+
+    If multiple rows per date exist, aggregates them first (sum/mean).
+    """
+    work = df.copy()
+    work[date_col] = pd.to_datetime(work[date_col], errors="coerce").dt.normalize()
+    work[measurement_col] = pd.to_numeric(work[measurement_col], errors="coerce")
+
+    work = work.dropna(subset=[date_col])
+
+    if agg == "mean":
+        daily = work.groupby(date_col, as_index=False)[measurement_col].mean()
+    else:
+        daily = work.groupby(date_col, as_index=False)[measurement_col].sum()
+
+    if daily.empty:
+        return daily, pd.DatetimeIndex([])
+
+    full = pd.date_range(daily[date_col].min(), daily[date_col].max(), freq=freq)
+    daily = daily.set_index(date_col).reindex(full)
+
+    missing = daily[daily[measurement_col].isna()].index
+    daily[measurement_col] = daily[measurement_col].fillna(0.0)
+
+    daily = daily.rename_axis(date_col).reset_index()
+    daily["imputed_zero_missing_date"] = daily[date_col].isin(missing)
+    return daily, missing
+
+
+@st.cache_data(show_spinner=False)
 def get_valid_date_bounds(df_work: pd.DataFrame, date_col: str) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
     """Return min/max valid timestamps for the selected date column."""
     valid_dates = pd.to_datetime(df_work[date_col], errors="coerce").dropna().sort_values()
@@ -278,8 +512,8 @@ def get_default_imr_date_window(df_work: pd.DataFrame, date_col: str) -> tuple[p
     if min_dt is None or max_dt is None:
         return None, None
 
-    default_start = max(min_dt, max_dt - pd.DateOffset(years=1) + pd.Timedelta(days=1))
-    return pd.Timestamp(default_start), pd.Timestamp(max_dt)
+    #default_start = max(min_dt, max_dt - pd.DateOffset(years=1) + pd.Timedelta(days=1))
+    return pd.Timestamp(min_dt), pd.Timestamp(max_dt)
 
 
 @st.cache_data(show_spinner=False)
@@ -402,7 +636,7 @@ def load_uploaded_file(uploaded_file) -> pd.DataFrame | None:
 
         if is_excel(uploaded_file.name):
             sheet_names = get_excel_sheet_names(file_bytes, uploaded_file.name)
-            sheet_name = st.sidebar.selectbox("2) Choose a sheet", options=sheet_names)
+            sheet_name = st.selectbox("Choose a sheet", options=sheet_names)
             return load_excel_sheet_from_bytes(file_bytes, uploaded_file.name, sheet_name)
 
         return load_csv_from_bytes(file_bytes)
@@ -421,6 +655,7 @@ def append_rule_hits(
     values: np.ndarray,
     indices: set[int] | np.ndarray | list[int],
     rule_name: str,
+    count_as_break: bool = True,
 ) -> None:
     """Append rule hits to the violations list with de-duplication by caller."""
     for idx in sorted(set(indices)):
@@ -437,6 +672,7 @@ def append_rule_hits(
                 "rule": rule_name,
                 "value": value,
                 "rule_description": RULE_DISPLAY_TEXT.get(rule_name, rule_name),
+                "count_as_break": bool(count_as_break),
             }
         )
 
@@ -446,7 +682,7 @@ def mark_run_same_side(values: np.ndarray, center_line: np.ndarray, min_run_len:
     values = np.asarray(values, dtype=float)
     center_line = np.asarray(center_line, dtype=float)
 
-    side = np.where(values > center_line, 1, np.where(values < center_line, -1, 0))
+    side = np.where(values > center_line, 1, np.where(values <= center_line, -1, 0))
     flagged: set[int] = set()
 
     i = 0
@@ -543,12 +779,44 @@ def mark_alternating_runs(values: np.ndarray, min_points: int) -> set[int]:
 # ============================================================
 # SPC Rule Detection
 # ============================================================
+def apply_uniform_date_format(fig, date_fmt_d3: str = DATE_FMT_D3) -> None:
+    """
+    Enforce consistent date display across all x-axes and hover tooltips in a Plotly figure.
+    Works for subplots too (applies to all x-axes).
+    """
+    # Axis tick labels
+    fig.update_xaxes(tickformat=date_fmt_d3)
+
+    # Hover date formatting (axis-level); traces can override if they have custom hovertemplate
+    fig.update_xaxes(hoverformat=date_fmt_d3)
+
+    # If any traces define their own hovertemplate, enforce date format there too
+    for tr in fig.data:
+        # Only apply to traces that actually use x (time-series)
+        if hasattr(tr, "hovertemplate") and tr.hovertemplate:
+            # Replace any existing x formatting with our format if present,
+            # otherwise prepend an x line with our format.
+            if "%{x|" in tr.hovertemplate:
+                # crude but effective: normalize any x date formatting to our format
+                import re
+                tr.hovertemplate = re.sub(r"%\{x\|[^}]+\}", f"%{{x|{date_fmt_d3}}}", tr.hovertemplate)
+            else:
+                tr.hovertemplate = f"%{{x|{date_fmt_d3}}}<br>" + tr.hovertemplate
+        elif hasattr(tr, "hoverinfo") and tr.hoverinfo:
+            # leave hoverinfo-only traces as-is (not all traces support hovertemplate cleanly)
+            pass
+
+
 @st.cache_data(show_spinner=False)
 def detect_spc_rule_violations(
     df: pd.DataFrame,
     y_col: str,
     cl: float | np.ndarray,
     sigma: float | np.ndarray,
+    enabled_rules: dict[str, bool],
+    rule_points: dict[str, int],
+    rule_window_threshold: dict[str, dict[str, int]],
+    mark_all_sequence_points: bool = True,
 ) -> pd.DataFrame:
     """
     Detect SPC rule violations for a primary chart.
@@ -576,99 +844,278 @@ def detect_spc_rule_violations(
     upper_3 = cl_arr + 3 * sigma_arr
     lower_3 = cl_arr - 3 * sigma_arr
 
+    # --- Helpers to split indices into contributory vs break points ---
+
+    def _split_contiguous_runs_threshold(idxs, threshold: int) -> tuple[set[int], set[int]]:
+        """
+        For each contiguous run in idxs:
+          - first (threshold-1) points are contributory
+          - from threshold-th point onward are breaks
+        Returns: (breaks, contributory)
+        """
+        s = sorted({int(i) for i in idxs})
+        breaks: set[int] = set()
+        contrib: set[int] = set()
+
+        if not s:
+            return breaks, contrib
+        threshold = max(2, int(threshold))  # safety
+
+        run_start = prev = s[0]
+        for cur in list(s[1:]) + [None]:  # sentinel to flush last run
+            if cur is not None and cur == prev + 1:
+                prev = cur
+                continue
+
+            run_len = prev - run_start + 1
+            if run_len >= threshold:
+                contrib.update(range(run_start, run_start + threshold - 1))
+                breaks.update(range(run_start + threshold - 1, prev + 1))
+
+            if cur is None:
+                break
+            run_start = prev = cur
+
+        return breaks, contrib
+
+    def _split_window_end_runs_with_leading_contrib(end_idxs, window: int) -> tuple[set[int], set[int]]:
+        """
+        For rules defined by a moving window (Rule 8):
+          - breaks are the window END indices that satisfy the rule
+          - contributory are the first (window-1) points leading into the first break
+            of each contiguous streak of qualifying window ends.
+        Returns: (breaks, contributory)
+        """
+        ends = sorted({int(i) for i in end_idxs})
+        breaks: set[int] = set()
+        contrib: set[int] = set()
+        if not ends:
+            return breaks, contrib
+
+        window = max(2, int(window))  # safety
+        run_start = prev = ends[0]
+
+        for cur in list(ends[1:]) + [None]:
+            if cur is not None and cur == prev + 1:
+                prev = cur
+                continue
+
+            # Flush run of qualifying window-ends: [run_start .. prev]
+            breaks.update(range(run_start, prev + 1))
+
+            # Leading contributory points before the first break in this run
+            lead_start = max(0, run_start - (window - 1))
+            contrib.update(range(lead_start, run_start))
+
+            if cur is None:
+                break
+            run_start = prev = cur
+
+        # Make sure contrib doesn't overlap breaks
+        contrib -= breaks
+        return breaks, contrib
+
+    def _last_of_contiguous_runs(idxs) -> set[int]:
+        s = sorted({int(i) for i in idxs})
+        if not s:
+            return set()
+
+        last = set()
+        prev = s[0]
+
+        for cur in s[1:]:
+            if cur == prev + 1:
+                prev = cur
+            else:
+                last.add(prev)   # end of the previous contiguous run
+                prev = cur
+
+        last.add(prev)           # end of the final run
+        return last
+
     # Rule 1
-    rule1_idx = np.where((values > upper_3) | (values < lower_3))[0]
-    append_rule_hits(violations, dates, values, rule1_idx, "Rule 1")
+    if enabled_rules.get("Rule 1", True):
+        rule1_idx = np.where((values > upper_3) | (values < lower_3))[0]
+        append_rule_hits(violations, dates, values, rule1_idx, "Rule 1")
 
     # Rule 2
-    rule2_idx = mark_run_same_side(values, cl_arr, min_run_len=9)
-    append_rule_hits(violations, dates, values, rule2_idx, "Rule 2")
+    if enabled_rules.get("Rule 2", True):
+        r2 = int(rule_points.get("Rule 2", 9))
+        rule2_idx = mark_run_same_side(values, cl_arr, min_run_len=r2)
+
+        if mark_all_sequence_points:
+            # Current behavior: all points in qualifying runs are breaks
+            append_rule_hits(violations, dates, values, rule2_idx, "Rule 2", count_as_break=True)
+        else:
+            # New behavior: first (r2-1) contributory, from r2th onward are breaks
+            rule2_breaks, rule2_contrib = _split_contiguous_runs_threshold(rule2_idx, r2)
+            append_rule_hits(violations, dates, values, rule2_contrib, "Rule 2", count_as_break=False)
+            append_rule_hits(violations, dates, values, rule2_breaks, "Rule 2", count_as_break=True)
+    
+    #print(rule2_contrib)
 
     # Rule 3
-    rule3_idx = mark_monotonic_runs(values, min_points=6)
-    append_rule_hits(violations, dates, values, rule3_idx, "Rule 3")
+    if enabled_rules.get("Rule 3", True):
+        r3 = int(rule_points.get("Rule 3", 6))
+        rule3_idx = mark_monotonic_runs(values, min_points=r3)
+
+        if mark_all_sequence_points:
+            append_rule_hits(violations, dates, values, rule3_idx, "Rule 3", count_as_break=True)
+        else:
+            rule3_breaks, rule3_contrib = _split_contiguous_runs_threshold(rule3_idx, r3)
+            append_rule_hits(violations, dates, values, rule3_contrib, "Rule 3", count_as_break=False)
+            append_rule_hits(violations, dates, values, rule3_breaks, "Rule 3", count_as_break=True)
 
     # Rule 4
-    rule4_idx = mark_alternating_runs(values, min_points=14)
-    append_rule_hits(violations, dates, values, rule4_idx, "Rule 4")
+    if enabled_rules.get("Rule 4", True):
+        r4 = int(rule_points.get("Rule 4", 14))
+        rule4_idx = mark_alternating_runs(values, min_points=r4)
 
-    # Rule 5
-    rule5_idx: set[int] = set()
-    for i in range(2, n):
-        window = values[i - 2:i + 1]
-        if np.any(pd.isna(window)):
-            continue
+        if mark_all_sequence_points:
+            append_rule_hits(violations, dates, values, rule4_idx, "Rule 4", count_as_break=True)
+        else:
+            rule4_breaks, rule4_contrib = _split_contiguous_runs_threshold(rule4_idx, r4)
+            append_rule_hits(violations, dates, values, rule4_contrib, "Rule 4", count_as_break=False)
+            append_rule_hits(violations, dates, values, rule4_breaks, "Rule 4", count_as_break=True)
 
-        above = [j for j in range(3) if window[j] > upper_2[i - 2 + j]]
-        below = [j for j in range(3) if window[j] < lower_2[i - 2 + j]]
+    # Rule 5 (threshold + window)
+    if enabled_rules.get("Rule 5", True):
+        cfg5 = rule_window_threshold.get("Rule 5", {"window": 3, "threshold": 2})
+        w5 = int(cfg5.get("window", 3))
+        t5 = int(cfg5.get("threshold", 2))
 
-        if len(above) >= 2:
-            rule5_idx.update((i - 2) + np.array(above))
-        if len(below) >= 2:
-            rule5_idx.update((i - 2) + np.array(below))
+        # Safety clamps
+        w5 = max(2, w5)
+        t5 = min(max(1, t5), w5)
 
-    append_rule_hits(violations, dates, values, rule5_idx, "Rule 5")
+        rule5_idx: set[int] = set()
+        rule5_triggers_raw: set[int] = set()
 
-    # Rule 6
-    rule6_idx: set[int] = set()
-    for i in range(4, n):
-        window = values[i - 4:i + 1]
-        if np.any(pd.isna(window)):
-            continue
+        for i in range(w5 - 1, n):
+            window = values[i - (w5 - 1): i + 1]
+            if np.any(pd.isna(window)):
+                continue
 
-        above = [j for j in range(5) if window[j] > upper_1[i - 4 + j]]
-        below = [j for j in range(5) if window[j] < lower_1[i - 4 + j]]
+            above = [j for j in range(w5) if window[j] > upper_2[i - (w5 - 1) + j]]
+            below = [j for j in range(w5) if window[j] < lower_2[i - (w5 - 1) + j]]
 
-        if len(above) >= 4:
-            rule6_idx.update((i - 4) + np.array(above))
-        if len(below) >= 4:
-            rule6_idx.update((i - 4) + np.array(below))
+            if len(above) >= t5:
+                rule5_idx.update((i - (w5 - 1)) + np.array(above))
+                rule5_triggers_raw.add(i)
+            if len(below) >= t5:
+                rule5_idx.update((i - (w5 - 1)) + np.array(below))
+                rule5_triggers_raw.add(i)
+        
+        if mark_all_sequence_points:
+            append_rule_hits(violations, dates, values, rule7_idx, "Rule 7", count_as_break=True)
+        else:
+            rule7_breaks, rule7_contrib = _split_contiguous_runs_threshold(rule7_idx, r7)
+            append_rule_hits(violations, dates, values, rule7_contrib, "Rule 7", count_as_break=False)
+            append_rule_hits(violations, dates, values, rule7_breaks, "Rule 7", count_as_break=True)
 
-    append_rule_hits(violations, dates, values, rule6_idx, "Rule 6")
+
+    # Rule 6 (threshold + window)
+    if enabled_rules.get("Rule 6", True):
+        cfg6 = rule_window_threshold.get("Rule 6", {"window": 5, "threshold": 4})
+        w6 = int(cfg6.get("window", 5))
+        t6 = int(cfg6.get("threshold", 4))
+
+        # Safety clamps
+        w6 = max(2, w6)
+        t6 = min(max(1, t6), w6)
+
+        rule6_idx: set[int] = set()
+        rule6_triggers_raw: set[int] = set()
+        for i in range(w6 - 1, n):
+            window = values[i - (w6 - 1): i + 1]
+            if np.any(pd.isna(window)):
+                continue
+
+            above = [j for j in range(w6) if window[j] > upper_1[i - (w6 - 1) + j]]
+            below = [j for j in range(w6) if window[j] < lower_1[i - (w6 - 1) + j]]
+
+            if len(above) >= t6:
+                rule6_idx.update((i - (w6 - 1)) + np.array(above))
+                rule6_triggers_raw.add(i)
+            if len(below) >= t6:
+                rule6_idx.update((i - (w6 - 1)) + np.array(below))
+                rule6_triggers_raw.add(i)
+
+        if mark_all_sequence_points:
+            append_rule_hits(violations, dates, values, rule6_idx, "Rule 6")
+        else:
+            trigger = _last_of_contiguous_runs(rule6_triggers_raw)
+            contrib = (rule6_idx | rule6_triggers_raw) - trigger
+            append_rule_hits(violations, dates, values, contrib, "Rule 6", count_as_break=False)
+            append_rule_hits(violations, dates, values, trigger, "Rule 6", count_as_break=True)
 
     # Rule 7
-    rule7_idx: set[int] = set()
-    within_1 = np.abs(values - cl_arr) <= sigma_arr
+    if enabled_rules.get("Rule 7", True):
+        r7 = int(rule_points.get("Rule 7", 15))
+        rule7_idx: set[int] = set()
+        within_1 = np.abs(values - cl_arr) <= sigma_arr
 
-    i = 0
-    while i < n:
-        if not within_1[i] or pd.isna(values[i]):
-            i += 1
-            continue
+        i = 0
+        while i < n:
+            if not within_1[i] or pd.isna(values[i]):
+                i += 1
+                continue
 
-        j = i
-        while j + 1 < n and within_1[j + 1] and not pd.isna(values[j + 1]):
-            j += 1
+            j = i
+            while j + 1 < n and within_1[j + 1] and not pd.isna(values[j + 1]):
+                j += 1
 
-        if (j - i + 1) >= 15:
-            rule7_idx.update(range(i, j + 1))
+            if (j - i + 1) >= r7:
+                rule7_idx.update(range(i, j + 1))
 
-        i = j + 1
+            i = j + 1
 
-    append_rule_hits(violations, dates, values, rule7_idx, "Rule 7")
+        if mark_all_sequence_points:
+            append_rule_hits(violations, dates, values, rule7_idx, "Rule 7")
+        else:
+            trigger = _last_of_contiguous_runs(rule7_idx)
+            contrib = set(rule7_idx) - trigger
+            append_rule_hits(violations, dates, values, contrib, "Rule 7", count_as_break=False)
+            append_rule_hits(violations, dates, values, trigger, "Rule 7", count_as_break=True)
 
     # Rule 8
-    rule8_idx: set[int] = set()
-    for i in range(7, n):
-        window = values[i - 7:i + 1]
-        if np.any(pd.isna(window)):
-            continue
+    if enabled_rules.get("Rule 8", True):
+        w8 = int(rule_points.get("Rule 8", 8))
+        w8 = max(2, w8)
 
-        outside_1 = np.array(
-            [abs(window[j] - cl_arr[i - 7 + j]) > sigma_arr[i - 7 + j] for j in range(8)]
-        )
-        sides = np.array(
-            [
-                1 if window[j] > cl_arr[i - 7 + j]
-                else (-1 if window[j] < cl_arr[i - 7 + j] else 0)
-                for j in range(8)
-            ]
-        )
+        # If ticked, preserve current behavior (mark all points in each qualifying window)
+        rule8_idx: set[int] = set()
 
-        if np.all(outside_1) and (np.any(sides == 1) and np.any(sides == -1)):
-            rule8_idx.update(range(i - 7, i + 1))
+        # Always track qualifying window-end indices (these are the "break events" when unticked)
+        rule8_end_idx: set[int] = set()
 
-    append_rule_hits(violations, dates, values, rule8_idx, "Rule 8")
+        for i in range(w8 - 1, n):
+            window = values[i - (w8 - 1): i + 1]
+            if np.any(pd.isna(window)):
+                continue
+
+            outside_1 = np.array(
+                [abs(window[j] - cl_arr[i - (w8 - 1) + j]) > sigma_arr[i - (w8 - 1) + j] for j in range(w8)]
+            )
+            sides = np.array(
+                [
+                    1 if window[j] > cl_arr[i - (w8 - 1) + j]
+                    else (-1 if window[j] < cl_arr[i - (w8 - 1) + j] else 0)
+                    for j in range(w8)
+                ]
+            )
+
+            if np.all(outside_1) and (np.any(sides == 1) and np.any(sides == -1)):
+                rule8_end_idx.add(i)
+                if mark_all_sequence_points:
+                    rule8_idx.update(range(i - (w8 - 1), i + 1))
+
+        if mark_all_sequence_points:
+            append_rule_hits(violations, dates, values, rule8_idx, "Rule 8", count_as_break=True)
+        else:
+            rule8_breaks, rule8_contrib = _split_window_end_runs_with_leading_contrib(rule8_end_idx, w8)
+            append_rule_hits(violations, dates, values, rule8_contrib, "Rule 8", count_as_break=False)
+            append_rule_hits(violations, dates, values, rule8_breaks, "Rule 8", count_as_break=True)
 
     violations_df = pd.DataFrame(violations)
     if violations_df.empty:
@@ -691,11 +1138,15 @@ def detect_secondary_limit_breaches(
     y_col: str,
     ucl: float | np.ndarray,
     lcl: float | np.ndarray,
+    enabled: bool,
 ) -> pd.DataFrame:
     """
     Detect secondary chart points beyond control limits.
     Core logic preserved from the original implementation.
     """
+    if not enabled:
+        return empty_violations_df()
+    
     values = pd.to_numeric(df[y_col], errors="coerce").to_numpy()
     dates = pd.to_datetime(df["date"]).to_numpy()
 
@@ -718,6 +1169,7 @@ def detect_secondary_limit_breaches(
                     "rule": "Secondary chart: point beyond control limit",
                     "value": value,
                     "rule_description": RULE_DISPLAY_TEXT["Secondary chart: point beyond control limit"],
+                    "count_as_break": True,
                 }
             )
 
@@ -1040,11 +1492,13 @@ def get_limits_with_optional_structural_breaks(
         "I-MR": calc_limits_imr,
         "Xbar-R": calc_limits_xbar_r,
         "Xbar-S": calc_limits_xbar_s,
+        "P": calc_limits_p,
     }
     primary_col_map = {
         "I-MR": "value",
         "Xbar-R": "xbar",
         "Xbar-S": "xbar",
+        "P": "p",
     }
 
     if chart_type not in calc_map:
@@ -1063,7 +1517,7 @@ def get_limits_with_optional_structural_breaks(
             valid_breaks = [idx for idx in break_indices if 0 <= idx < len(working_chart_df)]
             if valid_breaks:
                 working_chart_df.loc[valid_breaks, "MR"] = np.nan
-
+    
     limits = calc_segmented_limits(
         chart_df=working_chart_df,
         base_calc_func=calc_map[chart_type],
@@ -1094,6 +1548,11 @@ def build_imr_chart_df(df: pd.DataFrame, measurement_col: str, date_col: str | N
     chart_df = chart_df.reset_index(drop=True)
     chart_df["Index"] = np.arange(1, len(chart_df) + 1)
     chart_df["subgroup_number"] = np.arange(1, len(chart_df) + 1)
+    # If a holiday calendar is present in session_state, annotate chart_df
+    holiday_df = st.session_state.get("holiday_calendar_df")
+    if holiday_df is not None and not holiday_df.empty:
+        chart_df["date"] = pd.to_datetime(chart_df["date"], errors="coerce").dt.normalize()
+        chart_df = chart_df.merge(holiday_df, on="date", how="left")
     return chart_df
 
 
@@ -1140,7 +1599,7 @@ def calc_limits_imr(chart_df: pd.DataFrame) -> dict[str, dict[str, Any]]:
     values = chart_df["value"].to_numpy()
     moving_ranges = chart_df["MR"].dropna().to_numpy()
 
-    xbar = np.mean(values)
+    xbar = round(np.mean(values),1)
     mrbar = np.mean(moving_ranges) if len(moving_ranges) > 0 else 0.0
     sigma = mrbar / D2[2] if D2[2] != 0 else 0.0
 
@@ -1271,6 +1730,117 @@ def calc_limits_xbar_s(chart_df: pd.DataFrame) -> dict[str, dict[str, Any]]:
 # ============================================================
 # Plot Helpers
 # ============================================================
+@st.cache_data(show_spinner=False)
+def build_p_chart_df(
+    df: pd.DataFrame,
+    inspected_col: str,
+    defects_col: str,
+    date_col: str | None = None,
+) -> pd.DataFrame:
+    """Build chart-ready data for a P chart (proportion nonconforming)."""
+    use_cols = [inspected_col, defects_col] + ([date_col] if date_col else [])
+    work = df[use_cols].dropna().copy()
+
+    # Ensure valid numeric types
+    work[inspected_col] = coerce_numeric(work[inspected_col])
+    work[defects_col] = coerce_numeric(work[defects_col])
+    work = work.dropna(subset=[inspected_col, defects_col])
+
+    # Validate constraints
+    work = work[work[inspected_col] > 0]
+    work = work[(work[defects_col] >= 0) & (work[defects_col] <= work[inspected_col])]
+
+    if date_col:
+        work[date_col] = parse_date(work[date_col])
+        work = work.dropna(subset=[date_col]).sort_values(by=date_col)
+        work = work.rename(columns={date_col: "date"})
+    else:
+        work = work.reset_index(drop=True)
+        work["date"] = pd.to_datetime(np.arange(len(work)), unit="D", origin="unix")
+
+    work = work.rename(columns={inspected_col: "n", defects_col: "defects"})
+    work["p"] = work["defects"] / work["n"]
+    work["subgroup_number"] = np.arange(1, len(work) + 1)
+
+    return work
+
+
+@st.cache_data(show_spinner=False)
+def calc_limits_p(chart_df: pd.DataFrame) -> dict[str, dict[str, Any]]:
+    """
+    Calculate control limits for a P chart.
+
+    p_i = defects_i / n_i
+    pbar = sum(defects) / sum(n)
+    sigma_i = sqrt(pbar*(1-pbar)/n_i)
+    UCL_i = pbar + 3*sigma_i
+    LCL_i = pbar - 3*sigma_i
+    Clamp to [0, 1].
+    """
+    n = pd.to_numeric(chart_df["n"], errors="coerce").to_numpy(dtype=float)
+    d = pd.to_numeric(chart_df["defects"], errors="coerce").to_numpy(dtype=float)
+
+    n_sum = np.nansum(n)
+    if n_sum <= 0:
+        pbar = np.nan
+    else:
+        pbar = np.nansum(d) / n_sum
+
+    sigma = np.sqrt((pbar * (1.0 - pbar)) / n)
+    ucl = pbar + 3.0 * sigma
+    lcl = pbar - 3.0 * sigma
+
+    ucl = np.clip(ucl, 0.0, 1.0)
+    lcl = np.clip(lcl, 0.0, 1.0)
+
+    # IMPORTANT: match existing app keys ("CL", "UCL", "LCL", "sigma")
+    primary = {
+        "y_col": "p",
+        "label": "p",
+        "CL": repeat_line(pbar, len(chart_df)),
+        "UCL": ucl,
+        "LCL": lcl,
+        "sigma": sigma,
+    }
+
+    # Keep secondary disabled, but still provide expected keys so other code doesn't KeyError
+    secondary = {
+        "enabled": False,
+        "y_col": None,
+        "label": "",
+        "CL": None,
+        "UCL": None,
+        "LCL": None,
+        "sigma": None,
+    }
+
+    return {"primary": primary, "secondary": secondary}
+
+def compute_kde(x: np.ndarray, grid_size: int = 200):
+    """
+    Compute a Gaussian KDE for plotting.
+    Returns x_grid, density
+    """
+    x = np.asarray(x, dtype=float)
+    n = len(x)
+    if n < 2:
+        return None, None
+
+    std = np.std(x, ddof=1)
+    if std == 0:
+        return None, None
+
+    # Silverman's rule of thumb
+    bandwidth = 1.06 * std * n ** (-1 / 5)
+
+    x_grid = linspace(x.min(), x.max(), grid_size)
+    density = sum(
+        exp(-0.5 * ((x_grid - xi) / bandwidth) ** 2)
+        for xi in x
+    ) / (n * bandwidth * sqrt(2 * pi))
+
+    return x_grid, density
+
 def apply_plot_line_gaps(line_values: np.ndarray, break_positions: list[int] | None = None) -> np.ndarray:
     """Insert NaN at break positions so plotted lines visually split across segments."""
     arr = np.asarray(line_values, dtype=float).copy()
@@ -1365,6 +1935,14 @@ def add_limit_lines(
             row=row,
             col=col,
         )
+
+        for i in range(len(lower_2_arr)):
+            if lcl[i] > lower_2_arr[i]:
+                lower_2_arr[i] = lcl[i]
+        for i in range(len(lower_1_arr)):
+            if lower_2_arr[i] > lower_1_arr[i]:
+                lower_1_arr[i] = lower_2_arr[i]
+
         fig.add_trace(
             go.Scatter(
                 x=x_values,
@@ -1391,6 +1969,7 @@ def add_limit_lines(
             row=row,
             col=col,
         )
+
         fig.add_trace(
             go.Scatter(
                 x=x_values,
@@ -1447,13 +2026,22 @@ def add_rule_markers(
     default_visible_rule: str | None,
 ) -> set[str]:
     """
-    Add rule markers and multi-rule segmented overlays to a subplot.
+    Add rule markers and an all-rule-break overlay to a subplot.
 
     Updated behavior:
     - only the single most common rule for the whole figure is visible by default
-    - all other rule traces (including "Multiple rules") start as legend-only
+    - all other rule traces (including "All Rule Breaks") start as legend-only
     """
     if violations_df.empty:
+        return legend_shown_rules
+    
+    break_df = violations_df
+    contrib_df = violations_df.iloc[0:0].copy()
+    if "count_as_break" in violations_df.columns:
+        break_df = violations_df[violations_df["count_as_break"] == True].copy()
+        contrib_df = violations_df[violations_df["count_as_break"] == False].copy()
+
+    if break_df.empty and contrib_df.empty:
         return legend_shown_rules
 
     merge_cols = ["date", y_col]
@@ -1463,7 +2051,7 @@ def add_rule_markers(
     merged = (
         source_df[merge_cols]
         .merge(
-            violations_df[["date", "rule", "rule_description"]].drop_duplicates(),
+            break_df[["date", "rule", "rule_description"]].drop_duplicates(),
             on="date",
             how="inner",
         )
@@ -1474,15 +2062,15 @@ def add_rule_markers(
         )
     )
 
-    multi_rule_df = (
-        violations_df
+    all_rule_breaks_df = (
+        break_df
         .groupby("date", as_index=False)
         .agg(
             rule_count=("rule", "nunique"),
             rules=("rule", lambda x: sorted(set(x), key=lambda r: RULE_SORT_ORDER.get(r, 999))),
         )
+        .copy()
     )
-    multi_rule_df = multi_rule_df[multi_rule_df["rule_count"] > 1].copy()
 
     # Single-rule markers
     for rule_name in merged["rule"].unique():
@@ -1541,16 +2129,48 @@ def add_rule_markers(
         )
         legend_shown_rules.add(rule_name)
 
-    # Multi-rule segmented ring overlay
-    if not multi_rule_df.empty:
-        multi_rule_df = multi_rule_df.merge(source_df[merge_cols], on="date", how="left")
+    # Contributory (non-counting) points: white squares with red outline
+    if not contrib_df.empty:
+        contrib_points = (
+            source_df[merge_cols]
+            .merge(contrib_df[["date"]].drop_duplicates(), on="date", how="inner")
+            .drop_duplicates(subset=["date"])
+        )
 
-        style = RULE_STYLE_MAP["Multiple rules"]
-        show_legend = "Multiple rules" not in legend_shown_rules
-        multiple_visible_state = True if default_visible_rule == "Multiple rules" else "legendonly"
+        x_vals = contrib_points["date"] if x_axis_mode == "Time" else contrib_points[x_col]
+
+        fig.add_trace(
+            go.Scatter(
+                x=x_vals,
+                y=contrib_points[y_col],
+                mode="markers",
+                name="Contributory points",
+                legendgroup="Contributory points",
+                showlegend=("Contributory points" not in legend_shown_rules),
+                visible="legendonly",
+                marker=dict(
+                    symbol="square",
+                    size=11,
+                    color="white",
+                    line=dict(width=2, color="#FF0000"),
+                ),
+                hovertemplate="Contributory (non-counting)<br>Value: %{y:.5f}<extra></extra>",
+            ),
+            row=row,
+            col=col,
+        )
+        legend_shown_rules.add("Contributory points")
+
+    # All-rule-break overlay
+    if not all_rule_breaks_df.empty:
+        all_rule_breaks_df = all_rule_breaks_df.merge(source_df[merge_cols], on="date", how="left")
+
+        style = RULE_STYLE_MAP["All Rule Breaks"]
+        show_legend = "All Rule Breaks" not in legend_shown_rules
+        all_breaks_visible_state = True if default_visible_rule == "All Rule Breaks" else "legendonly"
 
         hover_text = []
-        for _, record in multi_rule_df.iterrows():
+        for _, record in all_rule_breaks_df.iterrows():
             rules_text = "<br>".join([f"- {rule}" for rule in record["rules"]])
             date_str = pd.to_datetime(record["date"]).strftime("%Y-%m-%d")
 
@@ -1570,25 +2190,28 @@ def add_rule_markers(
             hover_text.append(
                 base +
                 f"Value: {record[y_col]:.5f}<br>"
-                f"Multiple rules triggered:<br>{rules_text}"
+                f"Rule break(s) triggered:<br>{rules_text}"
             )
 
-        x_vals = multi_rule_df["date"] if x_axis_mode == "Time" else multi_rule_df[x_col]
+        x_vals = all_rule_breaks_df["date"] if x_axis_mode == "Time" else all_rule_breaks_df[x_col]
 
-        # Invisible anchor for hover + legend
         fig.add_trace(
             go.Scatter(
                 x=x_vals,
-                y=multi_rule_df[y_col],
+                y=all_rule_breaks_df[y_col],
                 mode="markers",
                 name=style["label"],
-                legendgroup="Multiple rules",
+                legendgroup="All Rule Breaks",
                 showlegend=show_legend,
-                visible=multiple_visible_state,
+                visible=all_breaks_visible_state,
                 marker=dict(
-                    size=12,
-                    color="rgba(0,0,0,0)",
-                    line=dict(width=0, color="rgba(0,0,0,0)"),
+                    symbol="square",
+                    size=11,
+                    color=style["color"],          # red fill
+                    line=dict(
+                        width=1.5,
+                        color="#000000",            # black border
+                    ),
                 ),
                 hovertemplate="%{text}<extra></extra>",
                 text=hover_text,
@@ -1596,96 +2219,7 @@ def add_rule_markers(
             row=row,
             col=col,
         )
-        legend_shown_rules.add("Multiple rules")
-
-        # Center cross
-        fig.add_trace(
-            go.Scatter(
-                x=x_vals,
-                y=multi_rule_df[y_col],
-                mode="markers",
-                name=None,
-                legendgroup="Multiple rules",
-                showlegend=False,
-                visible=multiple_visible_state,
-                marker=dict(
-                    symbol="x",
-                    size=10,
-                    color="#5B5B5B",
-                    line=dict(width=2, color="#5B5B5B"),
-                ),
-                hoverinfo="skip",
-            ),
-            row=row,
-            col=col,
-        )
-
-        # Draw segmented rings
-        ring_px = 12
-        plot_h = int(fig.layout.height) if fig.layout.height else PLOT_HEIGHT_DEFAULT
-        plot_w = int(fig.layout.width) if fig.layout.width else PLOT_WIDTH_DEFAULT
-
-        y_vals = pd.to_numeric(source_df[y_col], errors="coerce")
-        y_min, y_max = np.nanmin(y_vals), np.nanmax(y_vals)
-        y_span = float(y_max - y_min) if np.isfinite(y_max - y_min) and (y_max - y_min) != 0 else 1.0
-
-        if x_axis_mode in ("Subgroup", "Index"):
-            x_vals_num = pd.to_numeric(source_df[x_col], errors="coerce")
-            x_min, x_max = np.nanmin(x_vals_num), np.nanmax(x_vals_num)
-            x_span = float(x_max - x_min) if np.isfinite(x_max - x_min) and (x_max - x_min) != 0 else 1.0
-        else:
-            dts = pd.to_datetime(source_df["date"])
-            if len(dts) > 1:
-                x_span = (pd.to_datetime(dts.max()) - pd.to_datetime(dts.min())).total_seconds()
-                x_span = x_span if x_span != 0 else 1.0
-            else:
-                x_span = 1.0
-
-        r_y = ring_px / (plot_h / y_span)
-        r_x = ring_px / (plot_w / x_span)
-
-        for _, record in multi_rule_df.reset_index(drop=True).iterrows():
-            rules_list = record["rules"]
-            if not isinstance(rules_list, (list, tuple)) or len(rules_list) == 0:
-                continue
-
-            k = len(rules_list)
-            x0 = record["date"] if x_axis_mode == "Time" else record[x_col]
-            y0 = record[y_col]
-
-            for j, rule_name in enumerate(rules_list):
-                color = RULE_STYLE_MAP.get(rule_name, DEFAULT_RULE_STYLE)["color"]
-
-                theta0 = 2 * np.pi * (j / k)
-                theta1 = 2 * np.pi * ((j + 1) / k)
-                thetas = np.linspace(theta0, theta1, 24)
-
-                if x_axis_mode in ("Subgroup", "Index"):
-                    seg_x = x0 + (r_x * np.cos(thetas))
-                else:
-                    offsets = r_x * np.cos(thetas)
-                    seg_x = [
-                        pd.to_datetime(x0) + pd.to_timedelta(seconds, unit="s")
-                        for seconds in offsets
-                    ]
-
-                seg_y = y0 + (r_y * np.sin(thetas))
-
-                fig.add_trace(
-                    go.Scatter(
-                        x=seg_x,
-                        y=seg_y,
-                        mode="lines",
-                        name=None,
-                        legendgroup="Multiple rules",
-                        showlegend=False,
-                        visible=multiple_visible_state,
-                        line=dict(color=color, width=1),
-                        hoverinfo="skip",
-                    ),
-                    row=row,
-                    col=col,
-                )
+        legend_shown_rules.add("All Rule Breaks")
 
     return legend_shown_rules
 
@@ -1713,13 +2247,13 @@ def plot_spc_chart(
         x_col = "subgroup_number"
         x_axis_title = "Subgroup Number"
 
-    default_visible_rule = get_most_common_rule(primary_violations, secondary_violations)
+    default_visible_rule = "All Rule Breaks"
 
     fig = make_subplots(
         rows=2,
         cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.08,
+        vertical_spacing=0.15,
         subplot_titles=(
             f"{primary['label']} Chart",
             f"{secondary['label']} Chart" if secondary else "",
@@ -1752,10 +2286,10 @@ def plot_spc_chart(
     add_limit_lines(
         fig=fig,
         x_values=chart_df[x_col],
-        cl=primary["CL_series"],
-        ucl=primary["UCL_series"],
-        lcl=primary["LCL_series"],
-        sigma=primary["sigma_series"],
+        cl=primary["CL"],
+        ucl=primary["UCL"],
+        lcl=primary["LCL"],
+        sigma=primary.get("sigma", None),
         row=1,
         col=1,
         show_legend_once=True,
@@ -1777,7 +2311,7 @@ def plot_spc_chart(
     )
 
     # Secondary series
-    if secondary is not None:
+    if secondary["CL"] is not None:
         sec_df = chart_df.dropna(subset=[secondary["y_col"]]).copy()
         sec_idx = sec_df.index.to_numpy()
 
@@ -1849,7 +2383,32 @@ def plot_spc_chart(
         fig.update_yaxes(title_text=secondary["label"], row=2, col=1)
     fig.update_xaxes(title_text=x_axis_title, row=2, col=1)
 
+
+    MAX_MONTH_TICKS = 36  # e.g., allow up to 36 monthly labels (3 years)
+    DATE_TICK_FMT_D3 = "%b %Y"  # 29 Apr 2026 (Plotly d3 time format)
+    # If you prefer full month: DATE_TICK_FMT_D3 = "%d %B %Y"
+    # Only apply dense monthly tick labels when it won't overcrowd the axis
+    if x_axis_mode == "Time":
+        x_dates = pd.to_datetime(chart_df[x_col], errors="coerce").dropna()
+        if not x_dates.empty:
+            min_d = x_dates.min()
+            max_d = x_dates.max()
+
+            # How many monthly ticks would "M1" produce across the range (inclusive)?
+            month_count = (max_d.year - min_d.year) * 12 + (max_d.month - min_d.month) + 1
+
+            if month_count <= MAX_MONTH_TICKS:
+                # Apply to the shared x-axis (row=2) is usually enough,
+                # but we can apply to all x-axes for safety.
+                fig.update_xaxes(dtick="M1", tickformat=DATE_TICK_FMT_D3)
+                
+    fig.update_layout(
+        xaxis_showticklabels=True,
+        xaxis2_showticklabels=True,
+    )
+
     return fig
+
 
 
 # ============================================================
@@ -1858,132 +2417,224 @@ def plot_spc_chart(
 @st.cache_data(show_spinner=False)
 def clean_working_data(
     df: pd.DataFrame,
-    measurement_col: str,
+    measurement_col: str | None,
     date_col: str | None,
     subgroup_col: str | None,
+    inspected_col: str | None,
+    defects_col: str | None,
     null_treatment: str,
 ) -> pd.DataFrame:
-    """Prepare the working dataset based on selected mappings."""
+    """Prepare the working dataset based on selected mappings (variable + attribute charts)."""
     df_work = df.copy()
-    df_work[measurement_col] = coerce_numeric(df_work[measurement_col])
 
-    if null_treatment == "zero":
-        df_work[measurement_col] = df_work[measurement_col].fillna(0)
-    else:
-        df_work = df_work.dropna(subset=[measurement_col])
+    # --- Coerce numeric columns ---
+    if measurement_col:
+        df_work[measurement_col] = coerce_numeric(df_work[measurement_col])
+        if null_treatment == "zero":
+            df_work[measurement_col] = df_work[measurement_col].fillna(0)
+        else:
+            df_work = df_work.dropna(subset=[measurement_col])
 
+    if inspected_col:
+        df_work[inspected_col] = coerce_numeric(df_work[inspected_col])
+
+    if defects_col:
+        df_work[defects_col] = coerce_numeric(df_work[defects_col])
+
+    # --- Parse date if provided ---
     if date_col:
         df_work[date_col] = parse_date(df_work[date_col])
 
-        # aggregate duplicate dates
-        duplicate_counts = df_work[date_col].value_counts()
+        # If duplicate dates exist, aggregate appropriately depending on available columns.
+        duplicate_counts = df_work[date_col].value_counts(dropna=True)
         has_duplicates = (duplicate_counts > 1).any()
 
         if has_duplicates:
-            df_work = (
-                df_work
-                .groupby(date_col, as_index=False, sort=True)
-                .agg({measurement_col: "sum"})
-            )
+            agg_dict: dict[str, str] = {}
+            if measurement_col:
+                agg_dict[measurement_col] = "sum"
+            if inspected_col:
+                agg_dict[inspected_col] = "sum"
+            if defects_col:
+                agg_dict[defects_col] = "sum"
 
-            # annotate aggregation for UI
+            # group only if we have something to aggregate
+            if agg_dict:
+                df_work = (
+                    df_work
+                    .dropna(subset=[date_col])
+                    .groupby(date_col, as_index=False, sort=True)
+                    .agg(agg_dict)
+                )
+
             df_work.attrs["dates_aggregated"] = True
             df_work.attrs["aggregated_date_count"] = int((duplicate_counts > 1).sum())
         else:
             df_work.attrs["dates_aggregated"] = False
 
+    # --- Subgroup is categorical ---
     if subgroup_col:
         df_work[subgroup_col] = df_work[subgroup_col].astype(str)
+
+    # --- Basic P-chart sanity filters (avoid divide-by-zero / invalid rows) ---
+    if inspected_col and defects_col:
+        df_work = df_work.dropna(subset=[inspected_col, defects_col])
+        df_work = df_work[df_work[inspected_col] > 0]
+        df_work = df_work[(df_work[defects_col] >= 0) & (df_work[defects_col] <= df_work[inspected_col])]
 
     return df_work
 
 
 @st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False)
 def evaluate_chart_validity(
     df_work: pd.DataFrame,
-    measurement_col: str,
+    measurement_col: str | None,
     subgroup_col: str | None,
+    inspected_col: str | None,
+    defects_col: str | None,
 ) -> ChartEvaluation:
     """
     Determine which chart types are valid.
-    Core validity rules preserved, including the original demo rule:
-    - Xbar-R for 1–11 unique subgroup labels
-    - Xbar-S for > 11 unique subgroup labels
+
+    Variable charts:
+    - I-MR requires a numeric measurement column and >= 3 measurements.
+    - Xbar-R/Xbar-S require subgroup column, >=2 subgroups, >=2 per subgroup,
+      supported subgroup sizes; selection rule uses max subgroup size.
+
+    Attribute chart:
+    - P requires inspected (n_i) and defects (D_i), with n_i > 0 and 0 <= D_i <= n_i,
+      and >= 3 samples.
     """
     messages: list[str] = []
     valid_options: list[str] = []
 
+    # -------------------------
     # I-MR
-    imr_valid = len(df_work) >= 3
-    if imr_valid:
-        valid_options.append("I-MR")
-        messages.append("✅ **I‑MR**: valid (measurement present; ≥ 3 rows).")
+    # -------------------------
+    if measurement_col is None:
+        messages.append("❌ **I‑MR**: measurement not selected.")
     else:
-        messages.append("❌ **I‑MR**: not enough data (need ≥ 3 measurements).")
+        imr_valid = df_work[measurement_col].dropna().shape[0] >= 3
+        if imr_valid:
+            valid_options.append("I-MR")
+            messages.append("✅ **I‑MR**: valid (measurement present; ≥ 3 rows).")
+        else:
+            messages.append("❌ **I‑MR**: not enough data (need ≥ 3 measurements).")
 
+    # -------------------------
     # Xbar-R / Xbar-S
-    if subgroup_col is None:
+    # -------------------------
+    if measurement_col is None:
+        messages.append("❌ **Xbar‑R**: measurement not selected.")
+        messages.append("❌ **Xbar‑S**: measurement not selected.")
+    elif subgroup_col is None:
         messages.append("❌ **Xbar‑R**: subgroup not selected.")
         messages.append("❌ **Xbar‑S**: subgroup not selected.")
-        return ChartEvaluation(valid_options=valid_options, messages=messages)
+    else:
+        subgroup_counts = df_work.groupby(subgroup_col)[measurement_col].count().sort_index()
+        unique_subgroups = subgroup_counts.shape[0]
+        subgroup_sizes = subgroup_counts.astype(int)
 
-    subgroup_counts = df_work.groupby(subgroup_col)[measurement_col].count().sort_index()
-    unique_subgroups = subgroup_counts.shape[0]
-    at_least_two_per_group = all_groups_at_least_two(subgroup_counts)
-    at_least_two_groups = unique_subgroups >= 2
+        at_least_two_groups = unique_subgroups >= 2
+        at_least_two_per_group = all_groups_at_least_two(subgroup_sizes)
 
-    # Preserve original demo rule exactly
-    if 1 <= unique_subgroups <= 11:
+        unsupported_sizes = sorted({int(n) for n in subgroup_sizes.unique() if not supported_n(int(n))})
+
         if not at_least_two_groups:
             messages.append(f"❌ **Xbar‑R**: only {unique_subgroups} subgroup(s); need ≥ 2 to chart.")
+            messages.append(f"❌ **Xbar‑S**: only {unique_subgroups} subgroup(s); need ≥ 2 to chart.")
         elif not at_least_two_per_group:
             messages.append("❌ **Xbar‑R**: some subgroup(s) have < 2 observations (range undefined).")
-        else:
-            valid_options.append("Xbar-R")
-            messages.append(f"✅ **Xbar‑R**: valid ({unique_subgroups} subgroup labels; each subgroup has ≥ 2).")
-    else:
-        messages.append(f"❌ **Xbar‑R**: requires 1–11 unique subgroups by your rule; found {unique_subgroups}.")
-
-    if unique_subgroups > 11:
-        if not at_least_two_per_group:
             messages.append("❌ **Xbar‑S**: some subgroup(s) have < 2 observations (std dev undefined).")
+        elif unsupported_sizes:
+            messages.append(f"❌ **Xbar‑R**: unsupported subgroup size(s) found {unsupported_sizes}. Supported n is 2–25.")
+            messages.append(f"❌ **Xbar‑S**: unsupported subgroup size(s) found {unsupported_sizes}. Supported n is 2–25.")
         else:
-            valid_options.append("Xbar-S")
-            messages.append("✅ **Xbar‑S**: valid (> 11 subgroup labels; each subgroup has ≥ 2).")
+            max_n = int(subgroup_sizes.max())
+            min_n = int(subgroup_sizes.min())
+
+            if max_n <= 7:
+                valid_options.append("Xbar-R")
+                messages.append(
+                    f"✅ **Xbar‑R**: valid (all subgroup sizes are between {min_n} and {max_n}; "
+                    f"use Xbar‑R when subgroup size is 2–7)."
+                )
+                messages.append("❌ **Xbar‑S**: not selected by rule because all subgroup sizes are ≤ 7.")
+            else:
+                valid_options.append("Xbar-S")
+                messages.append(
+                    f"❌ **Xbar‑R**: not selected by rule because one or more subgroup sizes are > 7 "
+                    f"(observed range: {min_n} to {max_n})."
+                )
+                messages.append(
+                    f"✅ **Xbar‑S**: valid (one or more subgroup sizes are > 7; "
+                    f"use Xbar‑S when subgroup size exceeds 7)."
+                )
+
+    # -------------------------
+    # P chart
+    # -------------------------
+    if inspected_col is None or defects_col is None:
+        messages.append("❌ **P**: inspected and/or defects not selected.")
     else:
-        messages.append(f"❌ **Xbar‑S**: requires > 11 unique subgroups by your rule; found {unique_subgroups}.")
+        # after clean_working_data we already filtered invalid rows; just ensure enough remain
+        usable = df_work[[inspected_col, defects_col]].dropna()
+        p_valid = usable.shape[0] >= 3
+
+        if p_valid:
+            valid_options.append("P")
+            messages.append("✅ **P**: valid (nᵢ and Dᵢ present; ≥ 3 samples; nᵢ>0; 0≤Dᵢ≤nᵢ).")
+        else:
+            messages.append("❌ **P**: not enough valid samples (need ≥ 3 rows with nᵢ and Dᵢ).")
 
     return ChartEvaluation(valid_options=valid_options, messages=messages)
 
 
 @st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False)
 def detect_violations_for_chart(
     chart_df: pd.DataFrame,
     limits: dict[str, dict[str, Any]],
+    enabled_rules: dict[str, bool],
+    rule_points: dict[str, int],
+    rule_window_threshold: dict[str, dict[str, int]],
+    enable_secondary: bool,
+    mark_all_sequence_points: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Detect primary SPC rule violations and secondary limit breaches."""
+    """Detect primary SPC rule violations and (optional) secondary limit breaches."""
+    primary_cfg = limits["primary"]
+    secondary_cfg = limits.get("secondary")
+
     primary_violations = detect_spc_rule_violations(
         chart_df,
-        y_col=limits["primary"]["y_col"],
-        cl=limits["primary"]["CL_series"],
-        sigma=limits["primary"]["sigma_series"],
+        y_col=primary_cfg["y_col"],
+        cl=primary_cfg["CL"],
+        sigma=primary_cfg["sigma"],
+        enabled_rules=enabled_rules,
+        rule_points=rule_points,
+        rule_window_threshold=rule_window_threshold,
+        mark_all_sequence_points=mark_all_sequence_points,
     )
 
-    secondary_col = limits["secondary"]["y_col"]
-    sec_df = chart_df.dropna(subset=[secondary_col]).copy()
+    # Default: no secondary violations unless enabled and configured
+    secondary_violations = empty_violations_df()
 
-    if sec_df.empty:
-        secondary_violations = empty_violations_df()
-    else:
-        sec_idx = sec_df.index.to_numpy()
-        ucl_sec = np.asarray(limits["secondary"]["UCL_series"], dtype=float)[sec_idx]
-        lcl_sec = np.asarray(limits["secondary"]["LCL_series"], dtype=float)[sec_idx]
+    has_secondary = (
+        enable_secondary
+        and secondary_cfg is not None
+        and secondary_cfg.get("enabled", True)
+        and secondary_cfg.get("y_col") is not None
+    )
 
+    if has_secondary:
         secondary_violations = detect_secondary_limit_breaches(
-            sec_df,
-            y_col=secondary_col,
-            ucl=ucl_sec,
-            lcl=lcl_sec,
+            chart_df,
+            y_col=secondary_cfg["y_col"],
+            ucl=secondary_cfg["UCL_series"],
+            lcl=secondary_cfg["LCL_series"],
+            enabled=True,
         )
 
     return primary_violations, secondary_violations
@@ -2044,6 +2695,11 @@ def get_imr_period_chart_payloads(
     backtrack_mode: str = "all_periods",
     focus_value: int | None = None,
     enable_structural_break_detection: bool = False,
+    enabled_rules: dict[str, bool] = {},
+    rule_points: dict[str, int] = {},
+    rule_window_threshold: dict[str, dict[str, int]] = {},
+    enable_secondary: bool = True,
+    mark_all_sequence_points: bool = True,
 ) -> list[dict[str, Any]]:
 
     """
@@ -2099,7 +2755,15 @@ def get_imr_period_chart_payloads(
             chart_type="I-MR",
             enable_structural_break_detection=enable_structural_break_detection,
         )
-        primary_violations, secondary_violations = detect_violations_for_chart(chart_df, limits)
+        primary_violations, secondary_violations = detect_violations_for_chart(
+            chart_df,
+            limits,
+            enabled_rules=enabled_rules,
+            rule_points=rule_points,
+            rule_window_threshold=rule_window_threshold,
+            enable_secondary=enable_secondary,
+            mark_all_sequence_points=mark_all_sequence_points,
+        )
 
 
         fig = plot_spc_chart(
@@ -2129,8 +2793,14 @@ def get_imr_period_chart_payloads(
 
 
 def render_imr_periodic_options(df_work: pd.DataFrame, date_col: str) -> dict[str, dict[str, Any]]:
-    """Render post-violation controls for additional yearly/quarterly/monthly I-MR charts."""
-    st.markdown("### Additional time-based I‑MR charts")
+    """
+    Render controls for additional yearly/quarterly/monthly I-MR charts.
+
+    Updated behavior:
+    - When enabled, automatically includes ALL available years, quarters, and months.
+    - Returns period_requests with count equal to the number of available periods per granularity.
+    - Uses backtrack_mode="all_periods" (because we want each historical period as its own chart).
+    """
 
     create_periodic = st.checkbox(
         "Create yearly / quarterly / monthly I‑MR charts as well",
@@ -2140,109 +2810,34 @@ def render_imr_periodic_options(df_work: pd.DataFrame, date_col: str) -> dict[st
     if not create_periodic:
         return {}
 
-    backtrack_mode_label = st.radio(
-        "How should the additional charts backtrack?",
-        options=list(BACKTRACK_OPTIONS.keys()),
-        index=0,
-        horizontal=True,
-        key="imr_backtrack_mode",
-    )
-    backtrack_mode = BACKTRACK_OPTIONS[backtrack_mode_label]
-
-    selections = st.multiselect(
-        "Select period types",
-        options=["yearly", "quarterly", "monthly"],
-        default=[],
-    )
-
-    period_requests: dict[str, dict[str, Any]] = {}
     freq_map = {"yearly": "Y", "quarterly": "Q", "monthly": "M"}
 
-    for granularity in selections:
-        available_periods_total = (
-            pd.to_datetime(df_work[date_col], errors="coerce")
-            .dropna()
-            .dt.to_period(freq_map[granularity])
-            .nunique()
-        )
+    # Coerce and validate dates once
+    dates = pd.to_datetime(df_work[date_col], errors="coerce").dropna()
+    if dates.empty:
+        st.info("No valid dates are available for yearly/quarterly/monthly chart creation.")
+        return {}
+
+    period_requests: dict[str, dict[str, Any]] = {}
+
+    for granularity, freq in freq_map.items():
+        available_periods_total = dates.dt.to_period(freq).nunique()
 
         if available_periods_total == 0:
             st.info(f"No valid dates are available for {granularity} chart creation.")
             continue
 
-        focus_value: int | None = None
-        focus_label: str | None = None
-        available_periods = int(available_periods_total)
-
-        if backtrack_mode == "same_period" and granularity in ["quarterly", "monthly"]:
-            focus_options = get_available_focus_values(df_work, date_col, granularity)
-
-            if not focus_options:
-                st.info(f"No valid {granularity[:-2]} values are available for {granularity} chart creation.")
-                continue
-
-            if granularity == "quarterly":
-                option_labels = {f"Quarter {q}": q for q in focus_options}
-                selected_focus_label = st.selectbox(
-                    "Which quarter should be tracked across years?",
-                    options=list(option_labels.keys()),
-                    key=f"focus_value_{granularity}",
-                )
-                focus_value = int(option_labels[selected_focus_label])
-            else:
-                option_labels = {calendar.month_name[m]: m for m in focus_options}
-                selected_focus_label = st.selectbox(
-                    "Which month should be tracked across years?",
-                    options=list(option_labels.keys()),
-                    key=f"focus_value_{granularity}",
-                )
-                focus_value = int(option_labels[selected_focus_label])
-
-            focus_label = format_focus_label(granularity, focus_value)
-            available_periods = count_available_period_occurrences(
-                df_work=df_work,
-                date_col=date_col,
-                granularity=granularity,
-                backtrack_mode=backtrack_mode,
-                focus_value=focus_value,
-            )
-
-            if available_periods == 0:
-                st.info(f"No historical {focus_label} periods are available in the data.")
-                continue
-
-        label_map = {
-            "yearly": "How many recent years should have separate SPC charts created?",
-            "quarterly": (
-                f"How many periods should be created for {focus_label} across years?"
-                if backtrack_mode == "same_period" and focus_label
-                else "How many recent quarters should have separate SPC charts created?"
-            ),
-            "monthly": (
-                f"How many periods should be created for {focus_label} across years?"
-                if backtrack_mode == "same_period" and focus_label
-                else "How many recent months should have separate SPC charts created?"
-            ),
-        }
-
         period_requests[granularity] = {
-            "count": int(
-                st.number_input(
-                    label_map[granularity],
-                    min_value=1,
-                    max_value=int(available_periods),
-                    value=min(1, int(available_periods)),
-                    step=1,
-                    key=f"period_count_{granularity}_{backtrack_mode}_{focus_value}",
-                )
-            ),
-            "backtrack_mode": backtrack_mode,
-            "focus_value": focus_value,
-            "focus_label": focus_label,
+            # include ALL periods
+            "count": int(available_periods_total),
+            # force "all_periods" so each year / year-quarter / year-month becomes a chart
+            "backtrack_mode": "all_periods",
+            # not used in all_periods mode
+            "focus_value": None,
+            "focus_label": None,
         }
 
     return period_requests
-
 
 def render_imr_periodic_charts(
     df_work: pd.DataFrame,
@@ -2252,20 +2847,25 @@ def render_imr_periodic_charts(
     enable_structural_break_detection: bool,
     split_histograms_by_structure: bool,
     scale_segmented_histograms: bool,
+    enabled_rules: dict[str, bool],
+    rule_points: dict[str, int],
+    rule_window_threshold: dict[str, dict[str, int]],
+    enable_secondary: bool,
+    show_info: bool,
 ) -> None:
     """
     Create additional I-MR charts for selected yearly / quarterly / monthly periods.
 
     Updated behavior:
-    - supports backtracking over all periods
-    - supports backtracking for the same quarter or month across years
-    - each chart is rendered inside its own Streamlit tab
-    - the chart, limit summary, and rule-break summaries stay together in the same tab
+    - Always uses three top-level tabs: Yearly, Quarterly, Monthly
+    - Under each: one sub-tab per available period (ALL periods included)
+    - Chart + histogram + limit summary + violations remain together in each sub-tab
     """
     if not period_requests:
         return
 
-    tab_payloads: list[dict[str, Any]] = []
+    # Build payloads grouped by granularity
+    payloads_by_granularity: dict[str, list[dict[str, Any]]] = {"yearly": [], "quarterly": [], "monthly": []}
 
     for granularity, config in period_requests.items():
         payloads = get_imr_period_chart_payloads(
@@ -2273,104 +2873,246 @@ def render_imr_periodic_charts(
             measurement_col=measurement_col,
             date_col=date_col,
             granularity=granularity,
-            requested_count=int(config["count"]),
-            backtrack_mode=str(config["backtrack_mode"]),
+            requested_count=int(config["count"]),  # already set to ALL available
+            backtrack_mode=str(config["backtrack_mode"]),  # "all_periods"
             focus_value=config.get("focus_value"),
             enable_structural_break_detection=enable_structural_break_detection,
+            enabled_rules=enabled_rules,
+            rule_points=rule_points,
+            rule_window_threshold=rule_window_threshold,
+            enable_secondary=enable_secondary,
         )
-        tab_payloads.extend(payloads)
+        payloads_by_granularity.setdefault(granularity, []).extend(payloads)
 
-    if not tab_payloads:
+    any_payloads = any(payloads_by_granularity.get(g) for g in ["yearly", "quarterly", "monthly"])
+    if not any_payloads:
         st.info("No additional yearly, quarterly, or monthly I‑MR charts are available.")
         return
 
     st.markdown("## Additional I‑MR Charts")
 
-    tab_labels = [
-        f"{payload['granularity'].capitalize()} · {payload['period_label']}"
-        for payload in tab_payloads
-    ]
-    tabs = st.tabs(tab_labels)
+    # Top-level tabs in required order
+    top_labels = ["Yearly", "Quarterly", "Monthly"]
+    top_keys = ["yearly", "quarterly", "monthly"]
+    top_tabs = st.tabs(top_labels)
 
-    for tab, payload in zip(tabs, tab_payloads):
-        with tab:
-            if payload["status"] == "skipped":
-                st.warning(payload["message"])
+    for top_tab, granularity in zip(top_tabs, top_keys):
+        with top_tab:
+            payloads = payloads_by_granularity.get(granularity, [])
+            if not payloads:
+                st.info(f"No {granularity} charts are available.")
                 continue
 
-            st.plotly_chart(payload["fig"], use_container_width=True)
+            # Sub-tabs: one per period label
+            sub_labels = [p["period_label"] for p in payloads]
+            sub_tabs = st.tabs(sub_labels)
 
-            render_histograms_section(
-                chart_df=payload["chart_df"],
-                limits=payload["limits"],
-                chart_title=f"I-MR Chart — {payload['period_label']}",
-                split_by_structure=split_histograms_by_structure,
-                use_date_labels=True,
-                scale_segmented_histograms=scale_segmented_histograms,
-            )
+            for sub_tab, payload in zip(sub_tabs, payloads):
+                with sub_tab:
+                    if payload.get("status") == "skipped":
+                        st.warning(payload.get("message", "This chart was skipped."))
+                        continue
 
-            render_limit_summary(
-                chart_df=payload["chart_df"],
-                limits=payload["limits"],
-                split_by_structure=split_histograms_by_structure,
-                use_date_labels=True,
-            )
+                    render_limit_summary(
+                        chart_df=payload["chart_df"],
+                        limits=payload["limits"],
+                        split_by_structure=split_histograms_by_structure,
+                        use_date_labels=True,
+                    )
 
-            render_violations_section(
-                payload["primary_violations"],
-                payload["secondary_violations"],
-            )
+                    # Plotly: use_container_width is the correct Streamlit arg
+                    st.plotly_chart(payload["fig"], use_container_width=True)
+
+                    render_histograms_section(
+                        chart_df=payload["chart_df"],
+                        limits=payload["limits"],
+                        chart_title=f"I-MR Chart — {payload['period_label']}",
+                        split_by_structure=split_histograms_by_structure,
+                        use_date_labels=True,
+                        scale_segmented_histograms=scale_segmented_histograms,
+                    )
+
+                    if show_info:
+                        render_violations_section(
+                            payload.get("primary_violations", []),
+                            payload.get("secondary_violations", []),
+                        )
 
 
 # ============================================================
 # UI Rendering
 # ============================================================
-def render_spc_explainer() -> None:
-    """Render a plain-language SPC explanation and the rules used in this app."""
-    with st.expander("What is SPC and what rules does this app use?", expanded=False):
-        st.markdown(
-            """
-            **Statistical Process Control (SPC)** is a way of monitoring a process over time
-            to distinguish normal variation from unusual variation that may need attention.
+def render_spc_explainer(show_info) -> tuple[dict[str, bool], dict[str, int], dict[str, dict[str, int]], bool]:
+    """
+    Render SPC explanation and editable rule controls.
 
-            This app supports:
-            - **I-MR** charts for individual observations
-            - **Xbar-R** charts for subgroup averages and ranges
-            - **Xbar-S** charts for subgroup averages and standard deviations
+    Returns:
+      enabled_rules: rule_name -> bool
+      rule_points: rule_name -> int (Rules 2,3,4,7,8)
+      rule_window_threshold: rule_name -> {"window": int, "threshold": int} (Rules 5,6)
+      enable_secondary: bool
+    """
+    primary_rules = ["Rule 1","Rule 2","Rule 3","Rule 4","Rule 5","Rule 6","Rule 7","Rule 8"]
+    if show_info:
+        with st.expander("What is SPC and what rules does this app use?", expanded=False):
+            st.markdown(
+                """
+                **Statistical Process Control (SPC)** is a way of monitoring a process over time
+                to distinguish normal variation from unusual variation that may need attention.
 
-            The app checks for the following rule signals on the **primary chart**:
-            """
-        )
+                This app supports:
+                - **I-MR** charts for individual observations
+                - **Xbar-R** charts for subgroup averages and ranges
+                - **Xbar-S** charts for subgroup averages and standard deviations
 
-        primary_rules = [
-            "Rule 1", "Rule 2", "Rule 3", "Rule 4",
-            "Rule 5", "Rule 6", "Rule 7", "Rule 8"
-        ]
+                The app checks for the following rule signals on the **primary chart**:
+                """
+            )
+
+            st.markdown("#### Rule controls")
+
+            enabled_rules: dict[str, bool] = {}
+            rule_points: dict[str, int] = {}
+            rule_window_threshold: dict[str, dict[str, int]] = {}
+
+            for rule_name in primary_rules:
+                # Layout:
+                # [Enable] [Inputs...] [Description]
+                if rule_name in DEFAULT_RULE_WINDOW_THRESHOLD:
+                    c1, c2, c3, c4 = st.columns([0.12, 0.14, 0.14, 0.60])
+                elif rule_name in DEFAULT_RULE_POINTS:
+                    c1, c2, c4 = st.columns([0.12, 0.18, 0.70])
+                    c3 = None
+                else:
+                    c1, c4 = st.columns([0.12, 0.88])
+                    c2 = c3 = None
+
+                with c1:
+                    enabled_rules[rule_name] = st.checkbox(
+                        "On",
+                        value=DEFAULT_RULE_ENABLED.get(rule_name, True),
+                        key=f"rule_enabled_{rule_name}",
+                    )
+
+                # Single-number rules (2,3,4,7,8)
+                if rule_name in DEFAULT_RULE_POINTS and c2 is not None:
+                    with c2:
+                        rule_points[rule_name] = int(
+                            st.number_input(
+                                "Pts",
+                                min_value=2,
+                                max_value=200,
+                                value=int(DEFAULT_RULE_POINTS[rule_name]),
+                                step=1,
+                                key=f"rule_points_{rule_name}",
+                            )
+                        )
+
+                # Window+threshold rules (5,6)
+                if rule_name in DEFAULT_RULE_WINDOW_THRESHOLD and c2 is not None and c3 is not None:
+                    defaults = DEFAULT_RULE_WINDOW_THRESHOLD[rule_name]
+                    with c2:
+                        window_val = int(
+                            st.number_input(
+                                "Window",
+                                min_value=2,
+                                max_value=200,
+                                value=int(defaults["window"]),
+                                step=1,
+                                key=f"rule_window_{rule_name}",
+                            )
+                        )
+                    with c3:
+                        # Ensure threshold cannot exceed the chosen window
+                        threshold_default = min(int(defaults["threshold"]), window_val)
+                        threshold_val = int(
+                            st.number_input(
+                                "Threshold",
+                                min_value=1,
+                                max_value=window_val,
+                                value=threshold_default,
+                                step=1,
+                                key=f"rule_threshold_{rule_name}",
+                            )
+                        )
+                    rule_window_threshold[rule_name] = {"window": window_val, "threshold": threshold_val}
+
+                with c4:
+                    desc = get_rule_description_dynamic(rule_name, rule_points, rule_window_threshold)
+                    st.markdown(f"**{rule_name}**: {desc}")
+
+            st.markdown("On the **secondary chart**, the app checks:")
+            enable_secondary = st.checkbox(
+                "On",
+                value=DEFAULT_RULE_ENABLED.get("Secondary chart: point beyond control limit", True),
+                key="rule_enabled_secondary_limit_breach",
+            )
+            st.markdown(
+                f"- **Secondary chart: point beyond control limit**: "
+                f"{RULE_DISPLAY_TEXT['Secondary chart: point beyond control limit']}"
+            )
+    else:
+        # No UI controls shown: use defaults and return them
+        enabled_rules = {
+            rule_name: DEFAULT_RULE_ENABLED.get(rule_name, True)
+            for rule_name in primary_rules
+        }
+
+        # Defaults for single-number rules (2,3,4,7,8)
+        rule_points = {
+            rule_name: int(DEFAULT_RULE_POINTS[rule_name])
+            for rule_name in primary_rules
+            if rule_name in DEFAULT_RULE_POINTS
+        }
+
+        # Defaults for window+threshold rules (5,6)
+        rule_window_threshold = {}
         for rule_name in primary_rules:
-            st.markdown(f"- **{rule_name}**: {RULE_DISPLAY_TEXT[rule_name]}")
+            if rule_name in DEFAULT_RULE_WINDOW_THRESHOLD:
+                defaults = DEFAULT_RULE_WINDOW_THRESHOLD[rule_name]
+                window_val = int(defaults["window"])
+                threshold_val = int(defaults["threshold"])
 
-        st.markdown(
-            """
-            On the **secondary chart**, the app checks:
-            """
-        )
-        st.markdown(
-            f"- **Secondary chart: point beyond control limit**: "
-            f"{RULE_DISPLAY_TEXT['Secondary chart: point beyond control limit']}"
+                # Safety: threshold should never exceed window
+                threshold_val = min(threshold_val, window_val)
+
+                rule_window_threshold[rule_name] = {
+                    "window": window_val,
+                    "threshold": threshold_val,
+                }
+
+        # Secondary chart rule default
+        enable_secondary = DEFAULT_RULE_ENABLED.get(
+            "Secondary chart: point beyond control limit",
+            True
         )
 
-def render_header() -> None:
-    """Render the app header."""
+    return enabled_rules, rule_points, rule_window_threshold, enable_secondary
+
+
+def render_show_additional_information() -> bool:
+    """Render option for showing additional information in the app."""
+    return st.checkbox(
+        "Show additional information",
+        value=False,
+        help=(
+            "Selecting this option will result in additional information regarding the app's logic and data being shown."
+        ),
+    )
+
+
+def render_header() -> tuple[dict[str, bool], dict[str, int], dict[str, dict[str, int]], bool]:
+    """Render the App header"""
     st.title(APP_TITLE)
     st.markdown(APP_SUBTITLE)
-    render_spc_explainer()
+    return None
 
 
 def render_sidebar_file_upload() -> Any:
     """Render file upload control in the sidebar."""
-    st.sidebar.header("Setup")
-    return st.sidebar.file_uploader(
-        "1) Upload a CSV or Excel file",
+    st.header("Upload your Data")
+    return st.file_uploader(
+        "Upload a CSV or Excel file",
         type=SUPPORTED_UPLOAD_TYPES,
     )
 
@@ -2378,7 +3120,7 @@ def render_sidebar_file_upload() -> Any:
 def render_data_preview(df: pd.DataFrame) -> None:
     """Render dataset preview only."""
     with st.expander("Preview (first 10 rows)", expanded=False):
-        st.dataframe(df.head(10), use_container_width=True)
+        st.dataframe(df.head(10), width='stretch')
 
 def render_selected_columns_missing_notice(
     df: pd.DataFrame,
@@ -2400,23 +3142,40 @@ def render_selected_columns_missing_notice(
         )
 
 
-def render_column_mapping(df: pd.DataFrame) -> tuple[str | None, str | None, str | None]:
+def render_column_mapping(
+    df: pd.DataFrame,
+) -> tuple[str | None, str | None, str | None, str | None, str | None]:
     """Render column mapping controls in the sidebar."""
-    st.sidebar.subheader("Map your columns")
+    st.subheader("Column Mapping")
     all_cols = list(df.columns)
 
-    measurement_col = st.sidebar.selectbox(
-        "Measurement (required, numeric)",
+    # Variable charts (I-MR, Xbar-R, Xbar-S)
+    measurement_col = st.selectbox(
+        "Measurement (numeric; required for I‑MR / Xbar charts)",
         options=["—"] + all_cols,
         index=0,
     )
-    date_col = st.sidebar.selectbox(
+    date_col = st.selectbox(
         "Date (optional)",
         options=["(none)"] + all_cols,
         index=0,
     )
-    subgroup_col = st.sidebar.selectbox(
-        "Subgroup (optional, categorical)",
+    subgroup_col = st.selectbox(
+        "Subgroup (optional, categorical; required for Xbar charts)",
+        options=["(none)"] + all_cols,
+        index=0,
+    )
+
+    st.markdown("---")
+    st.caption("P‑chart (attributes): provide inspected count nᵢ and nonconforming count Dᵢ")
+
+    inspected_col = st.selectbox(
+        "Inspected (numeric; required for P chart)",
+        options=["(none)"] + all_cols,
+        index=0,
+    )
+    defects_col = st.selectbox(
+        "Nonconforming / Defects (numeric; required for P chart)",
         options=["(none)"] + all_cols,
         index=0,
     )
@@ -2424,24 +3183,28 @@ def render_column_mapping(df: pd.DataFrame) -> tuple[str | None, str | None, str
     m_col = None if measurement_col == "—" else measurement_col
     d_col = None if date_col == "(none)" else date_col
     g_col = None if subgroup_col == "(none)" else subgroup_col
+    n_col = None if inspected_col == "(none)" else inspected_col
+    dft_col = None if defects_col == "(none)" else defects_col
 
-    return m_col, d_col, g_col
+    return m_col, d_col, g_col, n_col, dft_col
 
 
-def render_null_treatment_option() -> str:
+def render_null_treatment_option(show_info) -> str:
     """Render null/empty measurement treatment options in the sidebar."""
-    st.sidebar.subheader("Null / Empty observation handling")
-    selected_label = st.sidebar.radio(
-        "How should empty/null measurement observations be treated?",
-        options=list(NULL_TREATMENT_OPTIONS.keys()),
-        index=0,
-    )
-    return NULL_TREATMENT_OPTIONS[selected_label]
+    if show_info:
+        st.sidebar.subheader("Null / Empty observation handling")
+        selected_label = st.sidebar.radio(
+            "How should empty/null measurement observations be treated?",
+            options=list(NULL_TREATMENT_OPTIONS.keys()),
+            index=0,
+        )
+        return NULL_TREATMENT_OPTIONS[selected_label]
+    else:
+        return "discard"
 
-def render_structural_break_option() -> bool:
+def render_structural_break_option(show_info) -> bool:
     """Render sidebar option for automatic structural break detection."""
-    st.sidebar.subheader("Structural break detection")
-    return st.sidebar.checkbox(
+    return st.checkbox(
         "Automatically detect structural breaks and re-baseline chart limits",
         value=False,
         help=(
@@ -2451,6 +3214,24 @@ def render_structural_break_option() -> bool:
             "are calculated from that break onward."
         ),
     )
+
+
+def render_missing_date_zero_option(show_info) -> bool:
+    "Render sidebar option to insert missing dates with zero values (requires date column)."
+    if show_info:
+        st.sidebar.subheader("Missing date handling")
+        return st.sidebar.checkbox(
+            "Insert missing dates and set their measurement to 0",
+            value=True,
+            help=(
+                "If a date column is mapped, this will ensure every day between the "
+                "minimum and maximum date exists. Missing days are inserted with measurement=0 "
+                "to capture events like shutdowns/maintenance as special-cause variation."
+            ),
+        )
+    else:
+        return True
+
 
 def render_histogram_segment_option(enable_structural_break_detection: bool) -> bool:
     """
@@ -2465,7 +3246,7 @@ def render_histogram_segment_option(enable_structural_break_detection: bool) -> 
     st.sidebar.subheader("Histogram and limit summary options")
     return st.sidebar.checkbox(
         "Create separate histograms and limit summaries for structural-break segments",
-        value=False,
+        value=True,
         help=(
             "If unticked, each SPC chart shows one histogram and one limit summary "
             "for the full chart. If ticked, separate histograms and limit summaries "
@@ -2494,6 +3275,22 @@ def render_histogram_scaling_option(split_histograms_by_structure: bool) -> bool
     )
 
 
+def render_sequence_rule_marker_option(show_info) -> bool:
+    "Render sidebar option controlling how sequence-based rule points are marked/count."
+    if show_info:
+        st.sidebar.subheader("Sequence-based rule marking")
+        return st.sidebar.checkbox(
+            "Mark all points in a sequence-based rule break",
+            value=False,
+            help=(
+                "If unticked, only the final point that triggers a sequence-based rule break is "
+                "counted/marked as a rule break. Earlier contributing points are shown as "
+                "white squares with a red outline and do not count as rule breaks."
+            ),
+        )
+    else:
+        return False
+
 def render_validity_messages(evaluation: ChartEvaluation) -> None:
     """Render chart validity assessment results."""
     st.subheader("Valid SPC chart types for this data")
@@ -2502,7 +3299,7 @@ def render_validity_messages(evaluation: ChartEvaluation) -> None:
 
 def get_histogram_bin_count(n: int) -> int:
     """Choose a reasonable histogram bin count based on sample size."""
-    return max(10, min(40, int(np.sqrt(max(n, 1)))))
+    return max(15, min(80, int(2 * np.sqrt(max(n, 1)))))
 
 
 def compute_scaled_histogram_settings(
@@ -2577,9 +3374,17 @@ def build_histogram_figure(
     xbins: dict[str, float] | None = None,
     yaxis_range: list[float] | None = None,
     yaxis_dtick: float | None = None,
-) -> go.Figure:
+):
     """Create a histogram figure for the provided series."""
     clean = pd.to_numeric(series, errors="coerce").dropna()
+
+    mean = clean.mean()
+    std = clean.std(ddof=1)
+    p75 = np.percentile(clean, 75)
+    p90 = np.percentile(clean, 90)
+
+    minus_3s = mean - 3 * std
+    plus_3s  = mean + 3 * std
 
     histogram_kwargs = {
         "x": clean,
@@ -2596,6 +3401,59 @@ def build_histogram_figure(
     fig = go.Figure()
     fig.add_trace(go.Histogram(**histogram_kwargs))
 
+    def add_vline(x, label, color):
+        fig.add_vline(
+            x=x,
+            line_width=2,
+            line_dash="dot",
+            line_color=color,
+            annotation_text=label,
+            annotation_position="top",
+            annotation_font_size=11,
+            opacity=0.9,
+        )
+
+    # Mean
+    add_vline(mean, "Mean", "#d62728")
+
+    # Percentiles
+    add_vline(p75, "p75", "#2ca02c")
+    add_vline(p90, "p90", "#ff7f0e")
+
+    # ±3 Sigma
+    add_vline(minus_3s, "−3σ", "#686868")
+    add_vline(plus_3s, "+3σ", "#686868")
+
+    values = [mean, p75, p90, minus_3s, plus_3s]
+    
+    x_kde, y_kde = compute_kde(clean.to_numpy())
+
+    if x_kde is not None:
+        # Determine bin width (must match histogram)
+        if xbins is not None and "size" in xbins:
+            bin_width = xbins["size"]
+        else:
+            # fallback: approximate from data and bin count
+            bin_count = get_histogram_bin_count(len(clean))
+            bin_width = (clean.max() - clean.min()) / bin_count
+
+        # Scale density to histogram counts
+        y_kde_scaled = y_kde * len(clean) * bin_width
+
+        fig.add_trace(
+            go.Scatter(
+                x=x_kde,
+                y=y_kde_scaled,
+                mode="lines",
+                name="Kernel Density",
+                line=dict(
+                            width=2,
+                            color="crimson",
+                        ),
+            )
+        )
+
+
     fig.update_layout(
         title=dict(text=title, x=0.5, xanchor="center"),
         xaxis_title=x_axis_title,
@@ -2606,13 +3464,19 @@ def build_histogram_figure(
         showlegend=False,
     )
 
+    fig.update_layout(
+        bargap=0.05,
+        legend=dict(orientation="h"),
+    )
+
+
     if yaxis_range is not None:
         fig.update_yaxes(range=yaxis_range)
 
     if yaxis_dtick is not None:
         fig.update_yaxes(dtick=yaxis_dtick)
 
-    return fig
+    return fig, values
 
 
 
@@ -2709,12 +3573,19 @@ def render_histograms_section(
                         else:
                             st.caption(f"Date range: {start_label} to {end_label}")
 
-                fig = build_histogram_figure(
+                fig, values = build_histogram_figure(
                     chart_df[y_col],
                     title=f"{chart_title} — {y_label} Histogram",
                     x_axis_title=y_label,
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width='stretch')
+
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.markdown(f"**Mean:** {format_metric_value(values[0])}")
+                c2.markdown(f"**75th Percentile:** {format_metric_value(values[1])}")
+                c3.markdown(f"**90th Percentile:** {format_metric_value(values[2])}")
+                c4.markdown(f"**-3σ:** {format_metric_value(values[3])}")
+                c5.markdown(f"**+3σ:** {format_metric_value(values[4])}")
         return
 
     # Segmented histograms
@@ -2762,7 +3633,7 @@ def render_histograms_section(
                     st.info("No valid values are available for this structural segment.")
                     continue
 
-                fig = build_histogram_figure(
+                fig, values = build_histogram_figure(
                     seg_df[y_col],
                     title=f"{chart_title} — {y_label} Histogram (Segment {idx})",
                     x_axis_title=y_label,
@@ -2770,8 +3641,14 @@ def render_histograms_section(
                     yaxis_range=scale_settings["yaxis_range"] if scale_settings is not None else None,
                     yaxis_dtick=scale_settings["yaxis_dtick"] if scale_settings is not None else None,
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width='stretch')
 
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.markdown(f"**Mean:** {format_metric_value(values[0])}")
+                c2.markdown(f"**75th Percentile:** {format_metric_value(values[1])}")
+                c3.markdown(f"**90th Percentile:** {format_metric_value(values[2])}")
+                c4.markdown(f"**-3σ:** {format_metric_value(values[3])}")
+                c5.markdown(f"**+3σ:** {format_metric_value(values[4])}")
 
 def render_limit_summary_metrics_for_segment(
     segment_summary: dict[str, Any],
@@ -2814,9 +3691,9 @@ def render_limit_summary(
 
             # Use the chart-level scalar values (current behavior)
             p1, p2, p3 = st.columns(3)
-            p1.metric(f"{primary['label']} CL", format_metric_value(primary["CL"]))
-            p2.metric(f"{primary['label']} UCL", format_metric_value(primary["UCL"]))
-            p3.metric(f"{primary['label']} LCL", format_metric_value(primary["LCL"]))
+            p1.metric(f"{primary['label']} CL", format_metric_value(primary["CL"]) if len(primary["CL"]) == 1 else "Varies")
+            p2.metric(f"{primary['label']} UCL", format_metric_value(primary["UCL"]) if len(primary["UCL"]) == 1 else "Varies")
+            p3.metric(f"{primary['label']} LCL", format_metric_value(primary["LCL"]) if len(primary["LCL"]) == 1 else "Varies")
 
             if secondary:
                 s1, s2, s3 = st.columns(3)
@@ -2870,12 +3747,17 @@ def build_rule_break_counts_df(violations_df: pd.DataFrame) -> pd.DataFrame:
     """Create a summary table showing number of occurrences per rule break."""
     if violations_df.empty:
         return pd.DataFrame(columns=["rule", "occurrences", "rule_description"])
+    
+    df_count = violations_df
+    if "count_as_break" in df_count.columns:
+        df_count = df_count[df_count["count_as_break"] == True]
 
     summary = (
-        violations_df.groupby("rule", as_index=False)
-        .size()
-        .rename(columns={"size": "occurrences"})
+        df_count.groupby("rule", as_index=False)
+         .size()
+         .rename(columns={"size": "occurrences"})
     )
+
     summary["rule_description"] = summary["rule"].map(RULE_DISPLAY_TEXT)
     summary["sort_order"] = summary["rule"].map(lambda x: RULE_SORT_ORDER.get(x, 999))
 
@@ -2901,13 +3783,13 @@ def render_violations_section(
             if primary_summary.empty:
                 st.success("No primary-chart SPC rule breaks detected.")
             else:
-                st.dataframe(primary_summary, use_container_width=True)
+                st.dataframe(primary_summary, width='stretch')
 
         with tab2:
             if secondary_summary.empty:
                 st.success("No secondary-chart rule breaks detected.")
             else:
-                st.dataframe(secondary_summary, use_container_width=True)
+                st.dataframe(secondary_summary, width='stretch')
 
 
 def render_imr_main_date_selector(df_work: pd.DataFrame, date_col: str) -> tuple[pd.Timestamp, pd.Timestamp] | None:
@@ -2925,15 +3807,32 @@ def render_imr_main_date_selector(df_work: pd.DataFrame, date_col: str) -> tuple
         st.info("No valid dates are available for date-based I‑MR chart filtering.")
         return None
 
-    st.markdown("### Main I‑MR chart date range")
+    col1, col2 = st.columns(2)
 
-    selected_range = st.date_input(
-        "Select the date range for the main I‑MR chart",
-        value=(default_start.date(), default_end.date()),
-        min_value=min_dt.date(),
-        max_value=max_dt.date(),
-        key="imr_main_date_range",
-    )
+    with col1:
+        start_date = st.date_input(
+            "Start date",
+            value=default_start.date(),
+            min_value=min_dt.date(),
+            max_value=max_dt.date(),
+            key="imr_main_start_date",
+        )
+
+    with col2:
+        end_date = st.date_input(
+            "End date",
+            value=default_end.date(),
+            min_value=min_dt.date(),
+            max_value=max_dt.date(),
+            key="imr_main_end_date",
+        )
+
+    # Ensure the range is valid (swap if user picks them “backwards”)
+    if start_date > end_date:
+        start_date, end_date = end_date, start_date
+
+    selected_range = (start_date, end_date)
+
 
     if isinstance(selected_range, tuple) and len(selected_range) == 2:
         start_date, end_date = selected_range
@@ -2971,10 +3870,27 @@ def run_imr_flow(
     enable_structural_break_detection: bool,
     split_histograms_by_structure: bool,
     scale_segmented_histograms: bool,
+    enabled_rules: dict[str, bool],
+    rule_points: dict[str, int],
+    rule_window_threshold: dict[str, dict[str, int]],
+    enable_secondary: bool,
+    mark_all_sequence_points: bool = True,
+    fill_missing_dates_zero: bool = False,
+    show_info: bool = False,
 ) -> None:
     """Execute I-MR build, limits, violations, and rendering."""
     df_for_main_chart = df_work.copy()
 
+    # If date_col is provided and user enabled the option, insert missing dates with zeros
+    if date_col and fill_missing_dates_zero:
+        df_for_main_chart, missing_dates = fill_missing_dates_with_zero(
+            df_for_main_chart, date_col=date_col, measurement_col=measurement_col, freq="D", agg="sum"
+        )
+        # Optional: show count
+        if show_info:
+            st.info(f"Inserted {len(missing_dates)} missing date(s) with measurement=0.")
+
+    df_work = df_for_main_chart
     if date_col:
         selected_bounds = render_imr_main_date_selector(df_work=df_work, date_col=date_col)
         if selected_bounds is None:
@@ -3010,7 +3926,22 @@ def run_imr_flow(
     )
 
     x_axis_mode = "Time" if date_col else "Index"
-    primary_violations, secondary_violations = detect_violations_for_chart(chart_df, limits)
+    primary_violations, secondary_violations = detect_violations_for_chart(
+        chart_df,
+        limits,
+        enabled_rules=enabled_rules,
+        rule_points=rule_points,
+        rule_window_threshold=rule_window_threshold,
+        enable_secondary=enable_secondary,
+        mark_all_sequence_points=mark_all_sequence_points,
+    )
+
+    render_limit_summary(
+        chart_df=chart_df,
+        limits=limits,
+        split_by_structure=split_histograms_by_structure,
+        use_date_labels=bool(date_col),
+    )
 
     fig = plot_spc_chart(
         chart_df=chart_df,
@@ -3021,7 +3952,8 @@ def run_imr_flow(
         x_axis_mode=x_axis_mode,
     )
 
-    st.plotly_chart(fig, use_container_width=True)
+    apply_uniform_date_format(fig)
+    st.plotly_chart(fig, width='stretch')
     
     render_histograms_section(
         chart_df=chart_df,
@@ -3031,15 +3963,9 @@ def run_imr_flow(
         use_date_labels=bool(date_col),
         scale_segmented_histograms=scale_segmented_histograms,
     )
-
-    render_limit_summary(
-        chart_df=chart_df,
-        limits=limits,
-        split_by_structure=split_histograms_by_structure,
-        use_date_labels=bool(date_col),
-    )
-
-    render_violations_section(primary_violations, secondary_violations)
+    
+    if show_info:
+        render_violations_section(primary_violations, secondary_violations)
 
     if date_col:
         period_requests = render_imr_periodic_options(df_work=df_work, date_col=date_col)
@@ -3051,6 +3977,11 @@ def run_imr_flow(
             enable_structural_break_detection=enable_structural_break_detection,
             split_histograms_by_structure=split_histograms_by_structure,
             scale_segmented_histograms=scale_segmented_histograms,
+            enabled_rules=enabled_rules,
+            rule_points=rule_points,
+            rule_window_threshold=rule_window_threshold,
+            enable_secondary=enable_secondary,
+            show_info=show_info,
         )
 
 
@@ -3061,6 +3992,12 @@ def run_xbar_r_flow(
     enable_structural_break_detection: bool,
     split_histograms_by_structure: bool,
     scale_segmented_histograms: bool,
+    enabled_rules: dict[str, bool],
+    rule_points: dict[str, int],
+    rule_window_threshold: dict[str, dict[str, int]],
+    enable_secondary: bool,
+    mark_all_sequence_points: bool = True,
+    show_info: bool = False,
 ) -> None:
     """Execute Xbar-R build, limits, violations, and rendering."""
     unsupported_sizes = check_unsupported_group_sizes(df_work, measurement_col, subgroup_col)
@@ -3078,7 +4015,22 @@ def run_xbar_r_flow(
         enable_structural_break_detection=enable_structural_break_detection,
     )
 
-    primary_violations, secondary_violations = detect_violations_for_chart(chart_df, limits)
+    primary_violations, secondary_violations = detect_violations_for_chart(
+        chart_df,
+        limits,
+        enabled_rules=enabled_rules,
+        rule_points=rule_points,
+        rule_window_threshold=rule_window_threshold,
+        enable_secondary=enable_secondary,
+        mark_all_sequence_points=mark_all_sequence_points,
+    )
+
+    render_limit_summary(
+        chart_df=chart_df,
+        limits=limits,
+        split_by_structure=split_histograms_by_structure,
+        use_date_labels=False,
+    )
 
     fig = plot_spc_chart(
         chart_df=chart_df,
@@ -3089,7 +4041,8 @@ def run_xbar_r_flow(
         x_axis_mode="Subgroup",
     )
 
-    st.plotly_chart(fig, use_container_width=True)
+    apply_uniform_date_format(fig)
+    st.plotly_chart(fig, width='stretch')
 
     render_histograms_section(
         chart_df=chart_df,
@@ -3100,14 +4053,8 @@ def run_xbar_r_flow(
         scale_segmented_histograms=scale_segmented_histograms,
     )
 
-    render_limit_summary(
-        chart_df=chart_df,
-        limits=limits,
-        split_by_structure=split_histograms_by_structure,
-        use_date_labels=False,
-    )
-
-    render_violations_section(primary_violations, secondary_violations)
+    if show_info:
+        render_violations_section(primary_violations, secondary_violations)
 
 
 def run_xbar_s_flow(
@@ -3117,6 +4064,12 @@ def run_xbar_s_flow(
     enable_structural_break_detection: bool,
     split_histograms_by_structure: bool,
     scale_segmented_histograms: bool,
+    enabled_rules: dict[str, bool],
+    rule_points: dict[str, int],
+    rule_window_threshold: dict[str, dict[str, int]],
+    enable_secondary: bool,
+    mark_all_sequence_points: bool = True,
+    show_info: bool = False,
 ) -> None:
     """Execute Xbar-S build, limits, violations, and rendering."""
     unsupported_sizes = check_unsupported_group_sizes(df_work, measurement_col, subgroup_col)
@@ -3134,7 +4087,22 @@ def run_xbar_s_flow(
         enable_structural_break_detection=enable_structural_break_detection,
     )
 
-    primary_violations, secondary_violations = detect_violations_for_chart(chart_df, limits)
+    primary_violations, secondary_violations = detect_violations_for_chart(
+        chart_df,
+        limits,
+        enabled_rules=enabled_rules,
+        rule_points=rule_points,
+        rule_window_threshold=rule_window_threshold,
+        enable_secondary=enable_secondary,
+        mark_all_sequence_points=mark_all_sequence_points,
+    )
+
+    render_limit_summary(
+        chart_df=chart_df,
+        limits=limits,
+        split_by_structure=split_histograms_by_structure,
+        use_date_labels=False,
+    )
 
     fig = plot_spc_chart(
         chart_df=chart_df,
@@ -3145,7 +4113,8 @@ def run_xbar_s_flow(
         x_axis_mode="Subgroup",
     )
 
-    st.plotly_chart(fig, use_container_width=True)
+    apply_uniform_date_format(fig)
+    st.plotly_chart(fig, width='stretch')
 
     render_histograms_section(
         chart_df=chart_df,
@@ -3156,15 +4125,77 @@ def run_xbar_s_flow(
         scale_segmented_histograms=scale_segmented_histograms,
     )
 
+    if show_info:
+        render_violations_section(primary_violations, secondary_violations)
+
+
+def run_p_flow(
+    df_work: pd.DataFrame,
+    inspected_col: str,
+    defects_col: str,
+    date_col: str | None,
+    enable_structural_break_detection: bool,
+    split_histograms_by_structure: bool,
+    scale_segmented_histograms: bool,
+    enabled_rules: dict[str, bool],
+    rule_points: dict[str, int],
+    rule_window_threshold: dict[str, dict[str, int]],
+    mark_all_sequence_points: bool = True,
+    show_info: bool = False,
+) -> None:
+    """Execute P chart build, limits, violations, and rendering."""
+    chart_df = build_p_chart_df(
+        df=df_work,
+        inspected_col=inspected_col,
+        defects_col=defects_col,
+        date_col=date_col,
+    )
+    
+    chart_df, limits = get_limits_with_optional_structural_breaks(
+        chart_df=chart_df,
+        chart_type="P",
+        enable_structural_break_detection=enable_structural_break_detection,
+    )
+    
+    # No secondary for P
+    primary_violations, secondary_violations = detect_violations_for_chart(
+        chart_df=chart_df,
+        limits=limits,
+        enabled_rules=enabled_rules,
+        rule_points=rule_points,
+        rule_window_threshold=rule_window_threshold,
+        enable_secondary=False,
+        mark_all_sequence_points=mark_all_sequence_points,
+    )
+
+    title = "P Chart (Proportion Nonconforming)"
+    fig = plot_spc_chart(
+        chart_df=chart_df,
+        limits=limits,
+        title=title,
+        primary_violations=primary_violations,
+        secondary_violations=secondary_violations,
+        x_axis_mode="Subgroup" if date_col is None else "Time",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    render_histograms_section(
+        chart_df=chart_df,
+        limits=limits,
+        chart_title=title,
+        split_by_structure=split_histograms_by_structure,
+        use_date_labels=(date_col is not None),
+        scale_segmented_histograms=scale_segmented_histograms,
+    )
+
     render_limit_summary(
         chart_df=chart_df,
         limits=limits,
         split_by_structure=split_histograms_by_structure,
-        use_date_labels=False,
+        use_date_labels=(date_col is not None),
     )
 
     render_violations_section(primary_violations, secondary_violations)
-
 
 # ============================================================
 # Main App
@@ -3172,67 +4203,94 @@ def run_xbar_s_flow(
 def main() -> None:
     """Run the Streamlit SPC application."""
     render_header()
+    show_info = render_show_additional_information()
+    enabled_rules, rule_points, rule_window_threshold, enable_secondary = render_spc_explainer(show_info)
 
-    uploaded_file = render_sidebar_file_upload()
-    df = load_uploaded_file(uploaded_file)
+    with st.expander("Setup", expanded=True):
+        uploaded_file = render_sidebar_file_upload()
+        df = load_uploaded_file(uploaded_file)
 
-    if df is None:
-        st.info("Upload a CSV or Excel file to get started.")
-        return
+        if df is None:
+            st.info("Upload a CSV or Excel file to get started.")
+            return
 
-    st.success("Dataset loaded successfully.")
-    render_data_preview(df)
+        if show_info:
+            st.success("Dataset loaded successfully.")
+            render_data_preview(df)
 
-    measurement_col, date_col, subgroup_col = render_column_mapping(df)
-    render_selected_columns_missing_notice(df, measurement_col, date_col, subgroup_col)
-    null_treatment = render_null_treatment_option()
-    enable_structural_break_detection = render_structural_break_option()
+        measurement_col, date_col, subgroup_col, inspected_col, defects_col = render_column_mapping(df)
+        render_selected_columns_missing_notice(df, measurement_col, date_col, subgroup_col)
+        null_treatment = render_null_treatment_option(show_info)
+        fill_missing_dates_zero = render_missing_date_zero_option(show_info)
+        
+        if (measurement_col is None) and ((inspected_col is None) or (defects_col is None)):
+            st.info("Please select a Measurement column to continue.")
+            st.stop()
 
-    split_histograms_by_structure = render_histogram_segment_option(
-        enable_structural_break_detection=enable_structural_break_detection
-    )
+        df_work = clean_working_data(df, measurement_col, date_col, subgroup_col, inspected_col, defects_col, null_treatment)
 
-    scale_segmented_histograms = render_histogram_scaling_option(
-        split_histograms_by_structure=split_histograms_by_structure
-    )
+        if df_work.empty:
+            st.warning("No valid numeric measurement data remains after cleaning.")
+            st.stop()
 
-    
-    if measurement_col is None:
-        st.info("Please select a Measurement column to continue.")
-        st.stop()
+        evaluation = evaluate_chart_validity(df_work, measurement_col, subgroup_col, inspected_col, defects_col)
+        if show_info:
+            render_validity_messages(evaluation)
 
-    df_work = clean_working_data(
-        df=df,
-        measurement_col=measurement_col,
-        date_col=date_col,
-        subgroup_col=subgroup_col,
-        null_treatment=null_treatment,
-    )
+        if not evaluation.valid_options:
+            st.warning("No valid SPC chart options based on the current selection. Adjust your column mapping or data.")
+            st.stop()
 
-    if df_work.empty:
-        st.warning("No valid numeric measurement data remains after cleaning.")
-        st.stop()
+        chosen_chart = st.radio(
+            "Select one of the valid options:",
+            options=evaluation.valid_options,
+            index=0,
+            horizontal=True,
+        )
 
-    evaluation = evaluate_chart_validity(
-        df_work=df_work,
-        measurement_col=measurement_col,
-        subgroup_col=subgroup_col,
-    )
-    render_validity_messages(evaluation)
+    # ---- Holiday calendar creation (only if date column provided)
+    holiday_calendar_df = None
+    if date_col and (chosen_chart == "I-MR"):
+        min_dt, max_dt = get_valid_date_bounds(df_work, date_col)
+        if min_dt is not None and max_dt is not None:
+            holiday_calendar_df = build_holiday_calendar(
+                start_dt=min_dt,
+                end_dt=max_dt,
+                country_code="ZA",   # You can make this a sidebar selectbox later
+                subdiv=None,
+                observed=True,
+                easter_week_mode="iso_week",  # or "goodfri_to_mon"
+            )
+            save_holiday_calendar_to_session(holiday_calendar_df)
 
-    if not evaluation.valid_options:
-        st.warning("No valid SPC chart options based on the current selection. Adjust your column mapping or data.")
-        st.stop()
+            # Optional: allow download from sidebar or main page
+            if show_info:
+                with st.sidebar.expander("Holiday calendar", expanded=False):
+                    if pyholidays is None:
+                        st.warning("Python package 'holidays' not installed. Public holiday detection is disabled.")
+                    st.caption("Saved holiday flags for this dataset's date range.")
+                    st.download_button(
+                        "Download holiday calendar (CSV)",
+                        data=holiday_calendar_df.to_csv(index=False).encode("utf-8"),
+                        file_name="holiday_calendar.csv",
+                        mime="text/csv",
+                    )
 
-    st.subheader("Choose a chart to graph")
-    chosen_chart = st.radio(
-        "Select one of the valid options:",
-        options=evaluation.valid_options,
-        index=0,
-        horizontal=True,
-    )
+    enable_structural_break_detection = render_structural_break_option(show_info)
 
-    st.subheader("Chart(s) with SPC Rules & Indicators")
+    if show_info:
+        split_histograms_by_structure = render_histogram_segment_option(
+            enable_structural_break_detection=enable_structural_break_detection
+        )
+
+        scale_segmented_histograms = render_histogram_scaling_option(
+            split_histograms_by_structure=split_histograms_by_structure
+        )
+    else:
+        split_histograms_by_structure = True
+        scale_segmented_histograms = True
+
+    mark_all_sequence_points = render_sequence_rule_marker_option(show_info)
 
     if chosen_chart == "I-MR":
         run_imr_flow(
@@ -3242,6 +4300,13 @@ def main() -> None:
             enable_structural_break_detection=enable_structural_break_detection,
             split_histograms_by_structure=split_histograms_by_structure,
             scale_segmented_histograms=scale_segmented_histograms,
+            enabled_rules=enabled_rules,
+            rule_points=rule_points,
+            rule_window_threshold=rule_window_threshold,
+            enable_secondary=enable_secondary,
+            mark_all_sequence_points=mark_all_sequence_points,
+            fill_missing_dates_zero=fill_missing_dates_zero,
+            show_info=show_info,
         )
 
     elif chosen_chart == "Xbar-R":
@@ -3255,6 +4320,12 @@ def main() -> None:
             enable_structural_break_detection=enable_structural_break_detection,
             split_histograms_by_structure=split_histograms_by_structure,
             scale_segmented_histograms=scale_segmented_histograms,
+            enabled_rules=enabled_rules,
+            rule_points=rule_points,
+            rule_window_threshold=rule_window_threshold,
+            enable_secondary=enable_secondary,
+            mark_all_sequence_points=mark_all_sequence_points,
+            show_info=show_info,
         )
 
     elif chosen_chart == "Xbar-S":
@@ -3268,7 +4339,34 @@ def main() -> None:
             enable_structural_break_detection=enable_structural_break_detection,
             split_histograms_by_structure=split_histograms_by_structure,
             scale_segmented_histograms=scale_segmented_histograms,
+            enabled_rules=enabled_rules,
+            rule_points=rule_points,
+            rule_window_threshold=rule_window_threshold,
+            enable_secondary=enable_secondary,
+            mark_all_sequence_points=mark_all_sequence_points,
+            show_info=show_info,
         )
+    elif chosen_chart == "P":
+        if inspected_col is None or defects_col is None:
+            st.error("P chart requires 'Inspected' and 'Defects' columns.")
+            st.stop()
+        run_p_flow(
+            df_work=df_work,
+            inspected_col=inspected_col,
+            defects_col=defects_col,
+            date_col=date_col,  # optional; works if your p data has real dates
+            enable_structural_break_detection=enable_structural_break_detection,
+            split_histograms_by_structure=split_histograms_by_structure,
+            scale_segmented_histograms=scale_segmented_histograms,
+            enabled_rules=enabled_rules,
+            rule_points=rule_points,
+            rule_window_threshold=rule_window_threshold,
+            mark_all_sequence_points=mark_all_sequence_points,
+            show_info=show_info,
+        )
+    else:
+        st.error(f"Unsupported chart type: {chart_type}")
+
 
 
 if __name__ == "__main__":
