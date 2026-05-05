@@ -1888,7 +1888,6 @@ def add_limit_lines(
     ucl_arr = as_array(ucl, n)
     lcl_arr = as_array(lcl, n)
     sigma_arr = as_array(sigma, n)
-
     plot_cl_arr = apply_plot_line_gaps(cl_arr, break_positions)
     plot_ucl_arr = apply_plot_line_gaps(ucl_arr, break_positions)
     plot_lcl_arr = apply_plot_line_gaps(lcl_arr, break_positions)
@@ -1936,12 +1935,15 @@ def add_limit_lines(
             col=col,
         )
 
-        for i in range(len(lower_2_arr)):
-            if lcl[i] > lower_2_arr[i]:
-                lower_2_arr[i] = lcl[i]
-        for i in range(len(lower_1_arr)):
-            if lower_2_arr[i] > lower_1_arr[i]:
-                lower_1_arr[i] = lower_2_arr[i]
+        try:
+            for i in range(len(lower_2_arr)):
+                if lcl[i] > lower_2_arr[i]:
+                    lower_2_arr[i] = lcl[i]
+            for i in range(len(lower_1_arr)):
+                if lower_2_arr[i] > lower_1_arr[i]:
+                    lower_1_arr[i] = lower_2_arr[i]
+        except:
+            pass
 
         fig.add_trace(
             go.Scatter(
@@ -2249,6 +2251,10 @@ def plot_spc_chart(
 
     default_visible_rule = "All Rule Breaks"
 
+    try:
+        flag = secondary["enabled"]
+    except:
+        flag = True
     fig = make_subplots(
         rows=2,
         cols=1,
@@ -2256,7 +2262,7 @@ def plot_spc_chart(
         vertical_spacing=0.15,
         subplot_titles=(
             f"{primary['label']} Chart",
-            f"{secondary['label']} Chart" if secondary else "",
+            f"{secondary['label']} Chart" if flag else "",
         ),
     )
 
@@ -2266,7 +2272,7 @@ def plot_spc_chart(
         for idx in break_indices
         if 0 <= idx < len(chart_df)
     ]
-
+    
     # Primary series
     fig.add_trace(
         go.Scatter(
@@ -2283,18 +2289,32 @@ def plot_spc_chart(
         col=1,
     )
 
-    add_limit_lines(
-        fig=fig,
-        x_values=chart_df[x_col],
-        cl=primary["CL"],
-        ucl=primary["UCL"],
-        lcl=primary["LCL"],
-        sigma=primary.get("sigma", None),
-        row=1,
-        col=1,
-        show_legend_once=True,
-        break_positions=break_indices,
-    )
+    try:
+        add_limit_lines(
+            fig=fig,
+            x_values=chart_df[x_col],
+            cl=primary["CL_series"],
+            ucl=primary["UCL_series"],
+            lcl=primary["LCL_series"],
+            sigma=primary.get("sigma", None),
+            row=1,
+            col=1,
+            show_legend_once=True,
+            break_positions=break_indices,
+        )
+    except:
+        add_limit_lines(
+            fig=fig,
+            x_values=chart_df[x_col],
+            cl=primary["CL"],
+            ucl=primary["UCL"],
+            lcl=primary["LCL"],
+            sigma=primary.get("sigma", None),
+            row=1,
+            col=1,
+            show_legend_once=True,
+            break_positions=break_indices,
+        )
 
     legend_shown_rules: set[str] = set()
     legend_shown_rules = add_rule_markers(
@@ -3691,9 +3711,21 @@ def render_limit_summary(
 
             # Use the chart-level scalar values (current behavior)
             p1, p2, p3 = st.columns(3)
-            p1.metric(f"{primary['label']} CL", format_metric_value(primary["CL"]) if len(primary["CL"]) == 1 else "Varies")
-            p2.metric(f"{primary['label']} UCL", format_metric_value(primary["UCL"]) if len(primary["UCL"]) == 1 else "Varies")
-            p3.metric(f"{primary['label']} LCL", format_metric_value(primary["LCL"]) if len(primary["LCL"]) == 1 else "Varies")
+            try:
+                flag = len(primary["CL"]) == 1
+            except:
+                flag = True
+            p1.metric(f"{primary['label']} CL", format_metric_value(primary["CL"]) if flag else "Varies")
+            try:
+                flag = len(primary["UCL"]) == 1
+            except:
+                flag = True
+            p2.metric(f"{primary['label']} UCL", format_metric_value(primary["UCL"]) if flag else "Varies")
+            try:
+                flag = len(primary["LCL"]) == 1
+            except:
+                flag = True
+            p3.metric(f"{primary['label']} LCL", format_metric_value(primary["LCL"]) if flag else "Varies")
 
             if secondary:
                 s1, s2, s3 = st.columns(3)
@@ -3942,7 +3974,7 @@ def run_imr_flow(
         split_by_structure=split_histograms_by_structure,
         use_date_labels=bool(date_col),
     )
-
+    
     fig = plot_spc_chart(
         chart_df=chart_df,
         limits=limits,
@@ -4168,7 +4200,14 @@ def run_p_flow(
         mark_all_sequence_points=mark_all_sequence_points,
     )
 
-    title = "P Chart (Proportion Nonconforming)"
+    render_limit_summary(
+        chart_df=chart_df,
+        limits=limits,
+        split_by_structure=split_histograms_by_structure,
+        use_date_labels=(date_col is not None),
+    )
+
+    title = "P Chart"
     fig = plot_spc_chart(
         chart_df=chart_df,
         limits=limits,
@@ -4186,13 +4225,6 @@ def run_p_flow(
         split_by_structure=split_histograms_by_structure,
         use_date_labels=(date_col is not None),
         scale_segmented_histograms=scale_segmented_histograms,
-    )
-
-    render_limit_summary(
-        chart_df=chart_df,
-        limits=limits,
-        split_by_structure=split_histograms_by_structure,
-        use_date_labels=(date_col is not None),
     )
 
     render_violations_section(primary_violations, secondary_violations)
