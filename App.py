@@ -1,13 +1,24 @@
+# -----------------------------------------------------------------------------
+# General imports
+# -----------------------------------------------------------------------------
+
+# Enables postponed evaluation of type hints (cleaner forward references and faster imports in some cases).
 from __future__ import annotations
 
+# For importing holiday dates.
 import calendar
 import io
+
+import numpy as np
+
+# Core data wrangling: reading Excel, cleaning, pivoting, grouping, totals.
+import pandas as pd
+
+# Defines lightweight config objects (e.g., SheetConfig) with minimal boilerplate.
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
 
-import numpy as np
-import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
